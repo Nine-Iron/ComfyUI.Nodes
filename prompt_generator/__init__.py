@@ -1,0 +1,333 @@
+"""Prompt Generator - two ComfyUI nodes that make random prompts.
+
+Random Prompt (Template)
+    Fills a template from word lists. Instant, no GPU memory, and the same
+    seed always gives the same prompt.
+        {a|b|c}          pick one
+        {2$$a|b|c}       pick two, joined with ", "
+        __subject__      a random line from a wildcard file
+        __folder/name__  a wildcard file in a subfolder
+    Wildcard files are plain text, one option per line, # for comments, read
+    from (first match wins):
+        ComfyUI/wildcards/  ComfyUI/models/wildcards/  <this folder>/wildcards/
+
+LLM Prompt
+    Has a language model write (or rewrite) a prompt. Providers:
+        anthropic          Claude, through the Anthropic API
+        openai             ChatGPT models, through the OpenAI API
+        openai_compatible  anything that speaks the OpenAI chat API: local
+                           llama.cpp server, Ollama, LM Studio, OpenRouter, ...
+    API keys are never typed into the node (workflows are saved inside every
+    image). They come from the environment or a keys file:
+        ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_COMPATIBLE_API_KEY
+        or <this folder>/keys.json  {"anthropic": "...", "openai": "...", "openai_compatible": "..."}
+
+Install: copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
+No dependencies beyond ComfyUI itself.
+"""
+
+import json
+import os
+import random
+import re
+import urllib.error
+import urllib.request
+
+import folder_paths
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE = getattr(folder_paths, "base_path", os.path.dirname(os.path.dirname(HERE)))
+WILDCARD_DIRS = [
+    os.path.join(BASE, "wildcards"),
+    os.path.join(folder_paths.models_dir, "wildcards"),
+    os.path.join(HERE, "wildcards"),
+]
+
+# ------------------------------------------------------------------ templates
+
+THEMES = {
+    "scene": "{__style__|__style__, __mood__} of __subject__ __setting__, __lighting__, __camera__, __color__",
+    "portrait": "__style__, portrait of __subject__, __lighting__, {close-up|shallow depth of field}, __mood__ atmosphere",
+    "landscape": "__style__, a {vast|quiet|dramatic} landscape __setting__, __weather__, __lighting__, __color__",
+    "fantasy": "{epic|whimsical|dark} fantasy art, __subject__ __setting__, {glowing runes|floating lights|ancient magic}, __lighting__, __mood__",
+    "sci-fi": "{retro-futuristic|cyberpunk|hard sci-fi} illustration, __subject__ __setting__, __lighting__, __color__, __camera__",
+    "photo": "{35mm film photo|cinematic photograph|candid photograph}, __subject__ __setting__, __weather__, __lighting__, __camera__",
+}
+THEME_NAMES = ["random"] + list(THEMES) + ["custom (use template)"]
+
+_CHOICE = re.compile(r"\{([^{}]*)\}")
+_WILD = re.compile(r"__([A-Za-z0-9_\-/\. ]+?)__")
+_wild_cache = {}
+
+
+def wildcard_names():
+    names = set()
+    for d in WILDCARD_DIRS:
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.endswith(".txt"):
+                    rel = os.path.relpath(os.path.join(root, f), d)
+                    names.add(rel[:-4].replace(os.sep, "/"))
+    return sorted(names)
+
+
+def load_wildcard(name):
+    """Lines of a wildcard file, or None. Names never leave the wildcard folders."""
+    name = name.strip().strip("/")
+    if not name or ".." in name.split("/"):
+        return None
+    for d in WILDCARD_DIRS:
+        path = os.path.realpath(os.path.join(d, name + ".txt"))
+        if not path.startswith(os.path.realpath(d) + os.sep) or not os.path.isfile(path):
+            continue
+        st = os.stat(path)
+        hit = _wild_cache.get(path)
+        if hit and hit[0] == st.st_mtime:
+            return hit[1]
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+        _wild_cache[path] = (st.st_mtime, lines)
+        return lines
+    return None
+
+
+def expand(template, rng, missing, depth=0):
+    """Resolve {a|b} choices and __wildcards__, innermost first, nested allowed."""
+    text = template
+    for _ in range(200):  # guards against templates that expand forever
+        changed = False
+
+        def choice(m):
+            nonlocal changed
+            changed = True
+            body = m.group(1)
+            count = 1
+            if "$$" in body:
+                head, body = body.split("$$", 1)
+                try:
+                    count = max(1, int(head.strip()))
+                except ValueError:
+                    count = 1
+            opts = body.split("|")
+            if count == 1:
+                return rng.choice(opts)
+            return ", ".join(rng.sample(opts, min(count, len(opts))))
+
+        def wild(m):
+            nonlocal changed
+            name = m.group(1)
+            lines = load_wildcard(name)
+            if not lines:
+                missing.add(name)
+                return name.split("/")[-1].replace("_", " ")
+            changed = True
+            return rng.choice(lines)
+
+        text = _CHOICE.sub(choice, text)
+        text = _WILD.sub(wild, text)
+        if not changed:
+            break
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*(,\s*)+", ", ", text)
+    return text.strip(" ,")
+
+
+class RandomPromptTemplate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "theme": (THEME_NAMES, {"default": "random",
+                                        "tooltip": "A built-in template. 'custom' uses the template box below."}),
+                "template": ("STRING", {
+                    "multiline": True, "default": "",
+                    # The node resolves {a|b} itself, from the seed; stop the
+                    # frontend from rolling them first.
+                    "dynamicPrompts": False,
+                    "tooltip": "{a|b|c} picks one, {2$$a|b|c} picks two, __name__ picks a line from "
+                               "wildcards/name.txt. Used when theme is 'custom'; with another theme it "
+                               "is added after the themed prompt."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                                 "control_after_generate": "randomize",
+                                 "tooltip": "Same seed, same prompt."}),
+            },
+            "optional": {
+                "prefix": ("STRING", {"default": "", "dynamicPrompts": False}),
+                "suffix": ("STRING", {"default": "", "dynamicPrompts": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "run"
+    CATEGORY = "prompt"
+    DESCRIPTION = "Builds a random prompt from a template and wildcard word lists."
+
+    def run(self, theme, template, seed, prefix="", suffix=""):
+        rng = random.Random(seed)
+        parts = []
+        if theme == "random":
+            theme = rng.choice(list(THEMES))
+        if theme in THEMES:
+            parts.append(THEMES[theme])
+        if template.strip():
+            parts.append(template.strip())
+        if not parts:
+            raise ValueError("Theme is 'custom' but the template box is empty.")
+        missing = set()
+        body = expand(", ".join(parts), rng, missing)
+        if missing:
+            print(f"[Prompt Generator] wildcard(s) not found, used the name instead: {', '.join(sorted(missing))}")
+        out = ", ".join(p for p in (expand(prefix, rng, missing), body, expand(suffix, rng, missing)) if p)
+        return (out,)
+
+
+# ------------------------------------------------------------------------ LLM
+
+PROVIDERS = ["anthropic", "openai", "openai_compatible"]
+DEFAULTS = {
+    "anthropic": ("https://api.anthropic.com", "claude-haiku-5-5"),
+    "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
+    "openai_compatible": ("http://127.0.0.1:8080/v1", ""),
+}
+ENV_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
+            "openai_compatible": "OPENAI_COMPATIBLE_API_KEY"}
+
+STYLES = {
+    "natural sentences (Flux, Qwen, Krea, SD3)":
+        "Write one image-generation prompt as 2 to 4 vivid, concrete natural-language sentences: "
+        "the subject, what it is doing, the setting, lighting, composition and visual style.",
+    "comma tags (SD 1.5, SDXL, Pony)":
+        "Write one image-generation prompt as a single line of comma-separated tags and short phrases, "
+        "most important first: subject, details, setting, lighting, style, quality tags. 20 to 40 tags.",
+}
+SYSTEM = ("You write prompts for text-to-image models. {style} Reply with the prompt only: no preamble, "
+          "no quotes, no title, no explanation, no markdown.")
+
+
+def api_key(provider):
+    key = os.environ.get(ENV_KEYS[provider], "").strip()
+    if key:
+        return key
+    try:
+        with open(os.path.join(HERE, "keys.json"), encoding="utf-8") as f:
+            return str(json.load(f).get(provider, "")).strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def post_json(url, headers, body, timeout):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        try:
+            err = json.loads(detail).get("error")
+            detail = err.get("message", detail) if isinstance(err, dict) else (err or detail)
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(f"{url} answered HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"could not reach {url}: {e.reason}") from None
+    except TimeoutError:
+        raise RuntimeError(f"{url} did not answer within {timeout}s") from None
+
+
+def clean(text):
+    text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()  # reasoning models
+    text = re.sub(r"^```\w*\n?|\n?```$", "", text).strip()
+    text = re.sub(r"^(here(?:'s| is) (?:a|the|your) [^:\n]*prompt[^:\n]*:|prompt:)\s*", "", text, flags=re.I)
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    return text.strip()
+
+
+def ask(provider, model, base_url, system, user, temperature, max_tokens, seed, timeout):
+    default_url, default_model = DEFAULTS[provider]
+    base = (base_url.strip() or default_url).rstrip("/")
+    model = model.strip() or default_model
+    key = api_key(provider)
+    if provider == "anthropic":
+        if not key:
+            raise RuntimeError("No Anthropic API key: set ANTHROPIC_API_KEY or put it in keys.json.")
+        data = post_json(base + "/v1/messages",
+                         {"x-api-key": key, "anthropic-version": "2023-06-01"},
+                         {"model": model, "max_tokens": max_tokens, "temperature": temperature,
+                          "system": system, "messages": [{"role": "user", "content": user}]}, timeout)
+        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    if provider == "openai" and not key:
+        raise RuntimeError("No OpenAI API key: set OPENAI_API_KEY or put it in keys.json.")
+    body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": temperature, "max_tokens": max_tokens, "seed": seed % (2 ** 31)}
+    if model:
+        body["model"] = model
+    data = post_json(base + "/chat/completions", {"Authorization": f"Bearer {key}"} if key else {}, body, timeout)
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"no answer in the reply: {str(data)[:300]}")
+    return (choices[0].get("message") or {}).get("content") or ""
+
+
+class LLMPrompt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "provider": (PROVIDERS, {"tooltip": "openai_compatible covers local servers (llama.cpp, "
+                                                    "Ollama, LM Studio) and services like OpenRouter."}),
+                "model": ("STRING", {"default": "", "tooltip": "Blank: claude-haiku-5-5 for anthropic, "
+                                                               "gpt-4o-mini for openai, the server's own model "
+                                                               "for openai_compatible (Ollama needs a name)."}),
+                "base_url": ("STRING", {"default": "", "tooltip": "Blank uses the provider's own address; "
+                                                                  "for openai_compatible the default is "
+                                                                  "http://127.0.0.1:8080/v1 (llama.cpp server). "
+                                                                  "Ollama: http://127.0.0.1:11434/v1"}),
+                "idea": ("STRING", {"multiline": True, "default": "", "dynamicPrompts": False,
+                                    "tooltip": "What the image should be about. Blank lets the model choose."}),
+                "style": (list(STYLES), {"tooltip": "Prompt format that suits your image model."}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "max_tokens": ("INT", {"default": 300, "min": 32, "max": 4000}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                                 "control_after_generate": "randomize",
+                                 "tooltip": "A new seed asks for a new prompt. ComfyUI reuses the last "
+                                            "answer while every input stays the same."}),
+                "timeout": ("INT", {"default": 120, "min": 5, "max": 900}),
+            },
+            "optional": {
+                "seed_prompt": ("STRING", {"forceInput": True,
+                                           "tooltip": "A prompt to rewrite and enrich, e.g. from "
+                                                      "Random Prompt (Template)."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "run"
+    CATEGORY = "prompt"
+    DESCRIPTION = "Has a language model (Claude, ChatGPT, or a local/compatible server) write an image prompt."
+
+    def run(self, provider, model, base_url, idea, style, temperature, max_tokens, seed, timeout, seed_prompt=None):
+        system = SYSTEM.format(style=STYLES[style])
+        asks = []
+        if seed_prompt and seed_prompt.strip():
+            asks.append(f"Rewrite and enrich this rough prompt, keeping its subject and intent:\n{seed_prompt.strip()}")
+        if idea.strip():
+            asks.append(f"The image should be about: {idea.strip()}")
+        if not asks:
+            asks.append("Invent an original, visually striking image of your own choosing.")
+        asks.append(f"(variation {seed % 100000})")  # nudges models that ignore the seed parameter
+        if provider == "anthropic":
+            temperature = min(temperature, 1.0)  # Anthropic's range is 0 to 1
+        text = clean(ask(provider, model, base_url, system, "\n\n".join(asks),
+                         temperature, max_tokens, seed, timeout))
+        if not text:
+            raise RuntimeError("The model returned an empty prompt.")
+        return (text,)
+
+
+NODE_CLASS_MAPPINGS = {"RandomPromptTemplate": RandomPromptTemplate, "LLMPrompt": LLMPrompt}
+NODE_DISPLAY_NAME_MAPPINGS = {"RandomPromptTemplate": "Random Prompt (Template)", "LLMPrompt": "LLM Prompt"}
