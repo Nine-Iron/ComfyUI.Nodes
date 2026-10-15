@@ -1,0 +1,10 @@
+{
+  "anthropic": "sk-ant-...",
+  "openai": "sk-...",
+  "openai_compatible": "",
+  "key_hosts": {
+    "anthropic": [],
+    "openai": [],
+    "openai_compatible": []
+  }
+}

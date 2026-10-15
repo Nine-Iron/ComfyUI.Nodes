@@ -13,6 +13,8 @@ const MARGIN = 4;       // gap the frontend leaves around a DOM widget, each sid
 const MIN_HEIGHT = 44;
 const MAX_HEIGHT = 340;
 const POLL_MS = 1000;
+const DEFAULT_MAX_TAGS = 8;
+const AUTO_ON = 3;      // most tags of one LoRA that are on without being clicked
 
 const STYLE = `
 .ltp-root { box-sizing: border-box; width: 100%; height: 100%; overflow-y: auto;
@@ -62,7 +64,7 @@ const infoCache = new Map(); // lora name -> Promise<info>
 function fetchInfo(name) {
   if (!infoCache.has(name)) {
     const request = api
-      .fetchApi(`/lora_tag_picker/tags?name=${encodeURIComponent(name)}`)
+      .fetchApi(`/Lora.Tag.Picker/tags?name=${encodeURIComponent(name)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .catch((err) => {
         infoCache.delete(name); // retry on the next refresh
@@ -125,23 +127,49 @@ function createPicker(node, inputName) {
 
   const state = {
     overrides: {},        // { loraName: { tag: bool } } - only where it differs from the default
-    expanded: new Set(),  // lora names showing their rare tags
+    expanded: new Set(),  // lora names showing every tag, not just the best ones
     loras: [],            // [{ name, info }]
     signature: null,
     height: MIN_HEIGHT,
     fitted: false,        // true once the node has been sized around real content
   };
 
-  const isActive = (name, entry) =>
-    state.overrides[name]?.[entry.tag] ?? entry.tier === "trigger";
+  // The node's max_tags setting: how many tags one LoRA shows up front.
+  const maxTags = () => {
+    const value = Math.floor(Number(node.widgets?.find((w) => w.name === "max_tags")?.value));
+    return Number.isFinite(value) && value >= 1 ? value : DEFAULT_MAX_TAGS;
+  };
 
-  function toggle(name, entry) {
-    const next = !isActive(name, entry);
+  // A LoRA's best tags: the ones shown up front. The first few triggers among
+  // them (front.auto) are the only tags that are on without being clicked.
+  const frontOf = (info) => {
+    const front = new Set((info.tags ?? []).filter((t) => t.tier !== "rare").slice(0, maxTags()));
+    front.auto = new Set([...front].filter((t) => t.tier === "trigger").slice(0, AUTO_ON));
+    return front;
+  };
+
+  const isDefault = (entry, front) => front.auto.has(entry);
+
+  const isActive = (name, entry, front) =>
+    state.overrides[name]?.[entry.tag] ?? isDefault(entry, front);
+
+  function toggle(name, entry, front) {
+    const next = !isActive(name, entry, front);
     const forLora = (state.overrides[name] ??= {});
-    if (next === (entry.tier === "trigger")) delete forLora[entry.tag];
+    if (next === isDefault(entry, front)) delete forLora[entry.tag];
     else forLora[entry.tag] = next;
     if (!Object.keys(forLora).length) delete state.overrides[name];
     render();
+  }
+
+  function describe(entry, info, pct) {
+    if (entry.coverage == null) return "From the file's declared trigger or dataset folder name";
+    const of = info.exact ? ` of ${info.images}` : "";
+    if (entry.kind === "phrase") return `About ${entry.count}${of} captions open with this (${pct}%)`;
+    if (entry.kind === "word") return `In about ${entry.count}${of} captions (${pct}%)`;
+    return info.exact
+      ? `In ${entry.count} of ${info.images} training images (${pct}%)`
+      : `Used ${entry.count} times, ${pct}% of the most used tag (file records no image count)`;
   }
 
   function fitHeight() {
@@ -173,31 +201,26 @@ function createPicker(node, inputName) {
     box.appendChild(head);
 
     const tags = info.tags ?? [];
+    const front = frontOf(info);
     const open = state.expanded.has(name);
-    const shown = tags.filter((t) => open || t.tier !== "rare" || isActive(name, t));
+    const shown = tags.filter((t) => open || front.has(t) || isActive(name, t, front));
     if (shown.length) {
       const chips = make("div", "ltp-chips");
       for (const entry of shown) {
-        const on = isActive(name, entry);
+        const on = isActive(name, entry, front);
         const chip = make("button", `ltp-chip${on ? " is-on" : ""}`, `${on ? "✓ " : ""}${entry.tag}`);
         chip.type = "button";
         chip.setAttribute("aria-pressed", String(on));
-        if (entry.coverage != null) {
-          const pct = Math.round(entry.coverage * 100);
-          chip.appendChild(make("small", "", `${pct}%`));
-          chip.title = info.exact
-            ? `${entry.tag}\nIn ${entry.count} of ${info.images} training images (${pct}%)`
-            : `${entry.tag}\nUsed ${entry.count} times, ${pct}% of the most used tag (file records no image count)`;
-        } else {
-          chip.title = `${entry.tag}\nFrom the file's declared trigger or dataset folder name`;
-        }
-        chip.addEventListener("click", () => toggle(name, entry));
+        const pct = entry.coverage == null ? null : Math.round(entry.coverage * 100);
+        if (pct != null) chip.appendChild(make("small", "", `${pct}%`));
+        chip.title = `${entry.tag}\n${describe(entry, info, pct)}`;
+        chip.addEventListener("click", () => toggle(name, entry, front));
         chips.appendChild(chip);
       }
       box.appendChild(chips);
     }
     const hidden = tags.length - shown.length;
-    if (hidden > 0 || (open && tags.some((t) => t.tier === "rare"))) {
+    if (hidden > 0 || (open && tags.length > front.size)) {
       const more = make("button", "ltp-more", open ? "show fewer" : `+${hidden} more`);
       more.type = "button";
       more.addEventListener("click", () => {
@@ -222,10 +245,10 @@ function createPicker(node, inputName) {
     fitHeight();
   }
 
-  // Re-read the graph; re-render only when the set of upstream LoRAs changed.
+  // Re-read the graph; re-render only when the upstream LoRAs or the limit changed.
   async function sync(force = false) {
     const names = findUpstreamLoras(node);
-    const signature = names.join("\n");
+    const signature = `${maxTags()}\n${names.join("\n")}`;
     if (!force && signature === state.signature && !state.loras.some((l) => l.info.failed)) {
       fitHeight(); // the node may have just become visible
       return;
@@ -254,10 +277,13 @@ function createPicker(node, inputName) {
   // At queue time, send exactly what the chips show.
   widget.serializeValue = async () => {
     try { await sync(true); } catch (err) { console.warn("[LoRA Tag Picker]", err); }
-    const resolved = state.loras.map(({ name, info }) => ({
-      lora: name,
-      tags: (info.tags ?? []).filter((t) => isActive(name, t)).map((t) => t.tag),
-    }));
+    const resolved = state.loras.map(({ name, info }) => {
+      const front = frontOf(info);
+      return {
+        lora: name,
+        tags: (info.tags ?? []).filter((t) => isActive(name, t, front)).map((t) => t.tag),
+      };
+    });
     return JSON.stringify({ v: 1, overrides: state.overrides, resolved });
   };
 
@@ -275,7 +301,7 @@ function createPicker(node, inputName) {
 }
 
 app.registerExtension({
-  name: "lora_tag_picker.LoraTagPicker",
+  name: "Lora.Tag.Picker.LoraTagPicker",
   getCustomWidgets() {
     return {
       [TYPE](node, inputName) {

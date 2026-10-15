@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# API keys for Prompt Generator (keys.example.json is the template)
+keys.json
+
+# Locally built civitai-likes binary (the prebuilt .linux.arm64 one is tracked)
+CivitAI.Model.Plus.Preview.Picker/civitai-likes
+CivitAI.Model.Plus.Preview.Picker/civitai-likes.exe
+
+# Personal Claude Code settings
+.claude/settings.local.json
+
+# Editor and OS clutter
+.DS_Store
+.vscode/
+.idea/

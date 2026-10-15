@@ -1,8 +1,16 @@
 // civitai-likes downloads the models you have liked on Civitai into a ComfyUI
 // models folder, without ever fetching one you already have.
 //
-// Files are saved as <base model tag>_<Civitai's file name>, for example
-// flux1_dev_some_lora.safetensors, so loader lists group by base model.
+// Files are saved with their base model in the name, where -tag says:
+// front flux1_dev_x.safetensors, end x_flux1_dev.safetensors, dot
+// x.flux1_dev.safetensors, folder loras/flux1_dev/x.safetensors, or none.
+// Files saved under any of these forms are recognised, so -tag can change
+// later (-rename-only moves existing files to the new form).
+//
+// Config: default flags can be kept in ~/.config/civitai-likes/config, one
+// "flag = value" per line (# comments). Flags on the command line win.
+// civitai-likes -print-config > ~/.config/civitai-likes/config writes a
+// starting file with every flag in it.
 // A liked model with versions for several base models gets one file per
 // selected base model (the newest version for each).
 //
@@ -23,35 +31,41 @@
 // choose from: rename the one you want to <name>.preview.<ext>. Files you
 // already have get previews too, unless one is already there.
 //
-// Checksums: none by default. The tool keeps a state file in the models folder
-// (.civitai-likes.json) with what it has seen; each run it checksums only the
-// model files that are new or changed since the last run, and uses the
-// recorded checksums to spot copies saved under other names. -checksum does
-// every file without one.
+// Checksums: only of what it downloads (to verify it), with -checksum, and with
+// -local. The tool keeps a state file in the models folder
+// (.civitai-likes.json) with what it has seen; -checksum checksums every model
+// file with none on record (each file once), and the recorded checksums are
+// used to spot copies saved under other names and to tell apart files that
+// share a name and size. Without them such cases are left alone, never guessed.
 //
 // Usage:
 //
 //	civitai-likes -n                 show what would happen, change nothing
 //	civitai-likes                    show the plan, ask, then download
 //	civitai-likes -yes               no question asked
-//	civitai-likes -base +pony        the default base models plus Pony
+//	civitai-likes -base pony         only Pony models
 //	civitai-likes -base sdxl1,sd1    only these base models
-//	civitai-likes -base all          every base model
+//	civitai-likes                    every base model (same as -base all)
 //	civitai-likes -rename            also rename files you already have to the tagged form
+//	civitai-likes -rename-only       only that: rename, no downloads or previews
+//	civitai-likes -rename-only -local   also files that are not liked models, looked up by checksum
+//	civitai-likes -rename-only -local -guess   and tag the ones Civitai does not know from their metadata
 //	civitai-likes -previews 4        keep up to 4 preview images per model to choose from
-//	civitai-likes -checksum          checksum every model file now (slow, once)
+//	civitai-likes -checksum          checksum model files with none on record (slow, once per file)
 //	civitai-likes -latest            also fetch the newest version when you hold an older one
 //
-// Default base models: flux1_dev, sdxl1, qwen, sd1, krea2. Every run lists the
-// other base models found in your likes with the tag to pass to -base.
+// -base picks the base models to handle (downloads, renames, previews); without
+// it every base is handled. A run with -base lists the other base models found
+// in your likes with the tag to pass, and says per selected base what it found.
 //
-// Build: go build -o civitai-likes civitai-likes.go   (standard library only)
+// Build: go build -o civitai-likes civitai.likes.go   (standard library only)
 package main
 
 import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,11 +73,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,11 +133,14 @@ func (f apiFile) sha256() string {
 }
 
 type apiVersion struct {
-	ID        int64      `json:"id"`
-	Name      string     `json:"name"`
-	BaseModel string     `json:"baseModel"`
-	Files     []apiFile  `json:"files"`
-	Images    []apiImage `json:"images"`
+	ID                int64      `json:"id"`
+	Name              string     `json:"name"`
+	BaseModel         string     `json:"baseModel"`
+	Availability      string     `json:"availability"`
+	EarlyAccessEndsAt string     `json:"earlyAccessEndsAt"`
+	UsageControl      string     `json:"usageControl"`
+	Files             []apiFile  `json:"files"`
+	Images            []apiImage `json:"images"`
 }
 
 type apiModel struct {
@@ -147,7 +166,7 @@ type httpError struct {
 func (e *httpError) Error() string {
 	switch e.status {
 	case http.StatusUnauthorized:
-		return "401: Civitai rejected the API token"
+		return "401: Civitai refused access with this API token"
 	case http.StatusForbidden:
 		return "403: this account is not allowed to download it (early access or restricted)"
 	case http.StatusNotFound:
@@ -272,6 +291,54 @@ func (c *client) whoami(ctx context.Context) (string, error) {
 // likedModels pages through the account's liked models.
 func (c *client) likedModels(ctx context.Context, limit int) ([]apiModel, error) {
 	q := url.Values{"favorites": {"true"}, "nsfw": {"true"}, "limit": {"100"}}
+	models, err := c.pageModels(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	// Early access versions may only be listed on request. Ask again with
+	// them included and merge, so either reading of the parameter works.
+	q.Set("earlyAccess", "true")
+	extra, err := c.pageModels(ctx, q, limit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not list early access versions:", err)
+		return models, nil
+	}
+	byID := map[int64]int{}
+	for i, m := range models {
+		byID[m.ID] = i
+	}
+	for _, m := range extra {
+		i, ok := byID[m.ID]
+		if !ok {
+			if len(models) >= limit {
+				continue
+			}
+			byID[m.ID] = len(models)
+			models = append(models, m)
+			continue
+		}
+		have := map[int64]bool{}
+		for _, v := range models[i].ModelVersions {
+			have[v.ID] = true
+		}
+		added := false
+		for _, v := range m.ModelVersions {
+			if !have[v.ID] {
+				models[i].ModelVersions = append(models[i].ModelVersions, v)
+				added = true
+			}
+		}
+		if added { // keep newest first; version ids only ever grow
+			sort.SliceStable(models[i].ModelVersions, func(a, b int) bool {
+				return models[i].ModelVersions[a].ID > models[i].ModelVersions[b].ID
+			})
+		}
+	}
+	return models, nil
+}
+
+// pageModels follows the cursor through every page of a models query.
+func (c *client) pageModels(ctx context.Context, q url.Values, limit int) ([]apiModel, error) {
 	var models []apiModel
 	seenID := map[int64]bool{}
 	seenCursor := map[string]bool{}
@@ -438,6 +505,26 @@ type fileState struct {
 	MTime    int64    `json:"mtime"`
 	SHA256   string   `json:"sha256,omitempty"`
 	Previews []string `json:"previews,omitempty"` // image URLs already saved beside it
+	Base     string   `json:"base,omitempty"`     // base model tag, e.g. flux1_dev
+	BaseName string   `json:"baseName,omitempty"` // what Civitai calls it, e.g. "Flux.1 D"
+	Model    string   `json:"model,omitempty"`    // Civitai model name
+	// What -local learned about a file no liked model accounts for.
+	ModelType    string `json:"modelType,omitempty"`
+	VersionID    int64  `json:"versionId,omitempty"`
+	NotOnCivitai bool   `json:"notOnCivitai,omitempty"`
+}
+
+// setBase notes which base model a file is for (read by the preview popup).
+func (s *stateFile) setBase(idx *index, path string, it item, baseName string) {
+	if it.tag == "" {
+		return
+	}
+	e := s.Files[idx.rel(path)]
+	if e == nil {
+		return
+	}
+	e.Base, e.BaseName, e.Model = it.tag, baseName, it.model.Name
+	e.NotOnCivitai = false
 }
 
 // stateFile is the tool's memory between runs, kept in the models folder.
@@ -445,12 +532,14 @@ type stateFile struct {
 	Version  int                   `json:"version"`
 	LastScan time.Time             `json:"lastScan"`
 	Files    map[string]*fileState `json:"files"` // by path relative to the models folder
-	path     string
-	existed  bool
+	// Early access versions Civitai refused to hand over, by version id.
+	EarlyAccess map[string]*eaRecord `json:"earlyAccess,omitempty"`
+	path        string
+	existed     bool
 }
 
 func loadState(path string) (*stateFile, error) {
-	st := &stateFile{Version: 1, Files: map[string]*fileState{}, path: path}
+	st := &stateFile{Version: 1, Files: map[string]*fileState{}, EarlyAccess: map[string]*eaRecord{}, path: path}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
@@ -463,6 +552,9 @@ func loadState(path string) (*stateFile, error) {
 	}
 	if st.Files == nil {
 		st.Files = map[string]*fileState{}
+	}
+	if st.EarlyAccess == nil {
+		st.EarlyAccess = map[string]*eaRecord{}
 	}
 	st.existed = true
 	return st, nil
@@ -509,7 +601,6 @@ func (s *stateFile) record(idx *index, path, sha string) {
 // last run, and every one not yet checksummed when all is set. The first run
 // only records what is there.
 func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
-	since := st.LastScan.UnixNano()
 	seen := map[string]bool{}
 	var todo []localFile
 	var todoBytes int64
@@ -521,15 +612,14 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 		seen[rel] = true
 		e := st.Files[rel]
 		if e == nil || e.Size != l.size || e.MTime != l.mtime {
-			var previews []string
-			if e != nil {
-				previews = e.Previews
+			ne := &fileState{Size: l.size, MTime: l.mtime}
+			if e != nil { // a changed file keeps what is known about it, not its checksum
+				ne.Previews, ne.Base, ne.BaseName, ne.Model = e.Previews, e.Base, e.BaseName, e.Model
 			}
-			e = &fileState{Size: l.size, MTime: l.mtime, Previews: previews}
+			e = ne
 			st.Files[rel] = e
 		}
-		newer := l.mtime > since || l.ctime > since
-		if e.SHA256 == "" && (all || (st.existed && newer)) {
+		if e.SHA256 == "" && all {
 			todo = append(todo, l)
 			todoBytes += l.size
 		}
@@ -540,11 +630,7 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 		}
 	}
 	if len(todo) > 0 {
-		why := "new or changed since the last run"
-		if all {
-			why = "not checksummed yet"
-		}
-		fmt.Fprintf(os.Stderr, "Checksumming %d model file(s), %s, %s...\n", len(todo), human(todoBytes), why)
+		fmt.Fprintf(os.Stderr, "Checksumming %d model file(s) with no checksum on record, %s (-checksum)...\n", len(todo), human(todoBytes))
 	}
 	for i, l := range todo {
 		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(todo), idx.rel(l.path), human(l.size))
@@ -753,6 +839,7 @@ func (c *client) fetchImage(ctx context.Context, rawURL, stem string) (string, e
 // -------------------------------------------------------------- base models
 
 // The base models fetched when -base is not given.
+// Common tags: known as tag folder names from the start (see knownTags).
 const defaultBases = "flux1_dev,sdxl1,qwen,sd1,krea2"
 
 // Civitai base model name (lower case) -> short tag. A name not listed here
@@ -815,47 +902,241 @@ func baseTag(name string) string {
 	return strings.Join(parts, "_")
 }
 
-// taggedName is the file name a model file gets on disk: its base model tag,
-// then the name Civitai gives it.
-func taggedName(tag, name string) string {
-	if tag == "" || tag == "unknown" || tag == "other" {
-		return name
+// Where the base model tag goes when a file is saved or renamed (-tag).
+var tagModes = []string{"front", "end", "dot", "folder", "none"}
+var tagMode = "front"
+
+func noTag(tag string) bool { return tag == "" || tag == "unknown" || tag == "other" }
+
+// tagForms lists every name a model file may have on disk: Civitai's own
+// name and each tagged form, so a file is recognised whichever -tag it was
+// saved with. Already-tagged Civitai names are not tagged twice.
+func tagForms(tag, name string) []string {
+	forms := []string{name}
+	if noTag(tag) {
+		return forms
 	}
-	if strings.HasPrefix(strings.ToLower(name), tag+"_") {
-		return name
+	stem, ext := strings.TrimSuffix(name, filepath.Ext(name)), filepath.Ext(name)
+	low := strings.ToLower(stem)
+	if !strings.HasPrefix(low, tag+"_") {
+		forms = append(forms, tag+"_"+name)
 	}
-	return tag + "_" + name
+	if !strings.HasSuffix(low, "_"+tag) {
+		forms = append(forms, stem+"_"+tag+ext)
+	}
+	if !strings.HasSuffix(low, "."+tag) {
+		forms = append(forms, stem+"."+tag+ext)
+	}
+	return forms
 }
 
-// parseBases reads the -base value: a comma list of tags or Civitai names.
-// "all" selects everything; entries written "+tag" add to the defaults.
+// taggedName is the file name a model file gets on disk under -tag; for
+// "folder" the tag is a subfolder instead (see tagSubdir).
+func taggedName(tag, name string) string {
+	if noTag(tag) {
+		return name
+	}
+	stem, ext := strings.TrimSuffix(name, filepath.Ext(name)), filepath.Ext(name)
+	low := strings.ToLower(stem)
+	switch tagMode {
+	case "front":
+		if strings.HasPrefix(low, tag+"_") {
+			return name
+		}
+		return tag + "_" + name
+	case "end":
+		if strings.HasSuffix(low, "_"+tag) {
+			return name
+		}
+		return stem + "_" + tag + ext
+	case "dot":
+		if strings.HasSuffix(low, "."+tag) {
+			return name
+		}
+		return stem + "." + tag + ext
+	}
+	return name // folder, none
+}
+
+func tagSubdir(tag string) string {
+	if tagMode == "folder" && !noTag(tag) {
+		return tag
+	}
+	return ""
+}
+
+// knownTags holds every base model tag the tool could have used in a name or
+// as a folder: the defaults, the aliases, -base, and the bases of the liked
+// models (filled in by run). A folder with one of these names is a tag folder.
+var knownTags = map[string]bool{}
+
+func init() {
+	for _, t := range strings.Split(defaultBases, ",") {
+		knownTags[t] = true
+	}
+	for _, t := range baseAliases {
+		knownTags[t] = true
+	}
+}
+
+func isTagDir(dir string) bool { return knownTags[strings.ToLower(filepath.Base(dir))] }
+
+// desiredPath is where a file already on disk should be under -tag, staying
+// in the folder it was filed in. A tag folder it sits in is replaced, never
+// nested: loras/sdxl1/x for a Pony file becomes loras/pony/x, not
+// loras/sdxl1/pony/x; outside folder mode it backs out of the tag folder.
+func desiredPath(current, tag, civitaiName string) string {
+	dir := filepath.Dir(current)
+	if isTagDir(dir) || (!noTag(tag) && strings.EqualFold(filepath.Base(dir), tag)) {
+		if tagMode == "folder" && strings.EqualFold(filepath.Base(dir), tag) {
+			return filepath.Join(dir, taggedName(tag, civitaiName)) // already in its own folder
+		}
+		dir = filepath.Dir(dir)
+	}
+	return filepath.Join(dir, tagSubdir(tag), taggedName(tag, civitaiName))
+}
+
+// parseBases reads the -base value: a comma list of tags or Civitai names
+// ("+tag" is the same as "tag"). Empty or "all" selects every base model.
 func parseBases(spec string) (set map[string]bool, all bool) {
 	set = map[string]bool{}
-	var entries []string
-	extend := false
 	for _, p := range strings.Split(spec, ",") {
-		p = strings.TrimSpace(p)
-		if strings.HasPrefix(p, "+") {
-			extend = true
-			p = strings.TrimSpace(p[1:])
-		}
-		if p != "" {
-			entries = append(entries, p)
-		}
-	}
-	if extend || len(entries) == 0 {
-		for _, d := range strings.Split(defaultBases, ",") {
-			set[d] = true
-		}
-	}
-	for _, p := range entries {
-		if strings.EqualFold(p, "all") {
+		p = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(p), "+"))
+		switch {
+		case p == "":
+		case strings.EqualFold(p, "all"):
 			all = true
-			continue
+		default:
+			set[baseTag(p)] = true
 		}
-		set[baseTag(p)] = true
+	}
+	if len(set) == 0 {
+		all = true
 	}
 	return set, all
+}
+
+// ------------------------------------------------------------ early access
+
+// eaRecord remembers a version whose download was refused while it was in
+// early access, so it is not tried again before the early access ends.
+type eaRecord struct {
+	Model     string    `json:"model"`
+	Version   string    `json:"version"`
+	Tag       string    `json:"tag,omitempty"`
+	Reason    string    `json:"reason"`
+	BlockedAt time.Time `json:"blockedAt"`
+	EndsAt    string    `json:"endsAt,omitempty"` // as Civitai gave it; "" = Civitai gave no end date
+	// What Civitai said about the version when it was refused, for diagnosis.
+	Availability string `json:"availability,omitempty"`
+	UsageControl string `json:"usageControl,omitempty"`
+}
+
+func parseTime(s string) (time.Time, bool) {
+	if s = strings.TrimSpace(s); s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z", "2006-01-02"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// earlyAccess reports whether Civitai currently has the version in early access.
+func (v apiVersion) earlyAccess(now time.Time) bool {
+	if strings.EqualFold(v.Availability, "EarlyAccess") {
+		return true
+	}
+	if t, ok := parseTime(v.EarlyAccessEndsAt); ok {
+		return now.Before(t)
+	}
+	return false
+}
+
+func eaUntil(endsAt string) string {
+	if t, ok := parseTime(endsAt); ok {
+		return t.Local().Format("Jan 2 2006 15:04")
+	}
+	return "an unknown date"
+}
+
+// blockedByAccess tells a refusal (not paid for, not allowed) apart from a
+// missing file or a network problem.
+func blockedByAccess(err error) bool {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.status == http.StatusUnauthorized || he.status == http.StatusPaymentRequired ||
+			he.status == http.StatusForbidden
+	}
+	return errors.Is(err, errWall)
+}
+
+// versionDetails asks Civitai for one version's current early access state.
+func (c *client) versionDetails(ctx context.Context, id int64) (apiVersion, error) {
+	var v apiVersion
+	err := c.getJSON(ctx, fmt.Sprintf("%s/api/v1/model-versions/%d", c.base.String(), id), &v)
+	return v, err
+}
+
+// applyEarlyAccess looks up the early access state of everything about to be
+// downloaded and holds back versions refused before, until their early access
+// ends or -ea asks for another try.
+func applyEarlyAccess(ctx context.Context, c *client, st *stateFile, items []item, retry bool, now time.Time) {
+	for i := range items {
+		it := &items[i]
+		if it.status != stGet {
+			continue
+		}
+		if d, err := c.versionDetails(ctx, it.ver.ID); err == nil {
+			if d.Availability != "" {
+				it.ver.Availability = d.Availability
+			}
+			if d.EarlyAccessEndsAt != "" {
+				it.ver.EarlyAccessEndsAt = d.EarlyAccessEndsAt
+			}
+			if d.UsageControl != "" {
+				it.ver.UsageControl = d.UsageControl
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		it.ea = it.ver.earlyAccess(now)
+		rec := st.EarlyAccess[strconv.FormatInt(it.ver.ID, 10)]
+		if rec == nil {
+			continue
+		}
+		it.eaBlocked = true
+		ends := it.ver.EarlyAccessEndsAt
+		if ends == "" {
+			ends = rec.EndsAt
+		}
+		t, known := parseTime(ends)
+		refused := fmt.Sprintf("refused %s (%s)", rec.BlockedAt.Local().Format("Jan 2"), rec.Reason)
+		switch {
+		case retry:
+			it.note = joinNote(it.note, "retry; "+refused)
+		case it.ea || (known && now.Before(t)):
+			it.status = stWait
+			it.note = fmt.Sprintf("%s; early access ends %s", refused, eaUntil(ends))
+		case !known:
+			// Civitai gives no end date, so there is nothing to wait for:
+			// held until -ea asks for another try.
+			it.status = stWait
+			it.note = refused + "; Civitai gives no end date, held until -ea"
+		default:
+			it.note = joinNote(it.note, "early access has ended, trying again")
+		}
+	}
+}
+
+func joinNote(a, b string) string {
+	if a == "" {
+		return b
+	}
+	return a + "; " + b
 }
 
 // -------------------------------------------------------------------- plan
@@ -865,6 +1146,7 @@ const (
 	stAlone = "alone" // something is in the way; left untouched
 	stSkip  = "skip"  // nothing to download
 	stGet   = "get"   // will be downloaded
+	stWait  = "wait"  // early access refused before; waiting for it to end
 )
 
 type thumbJob struct {
@@ -874,18 +1156,21 @@ type thumbJob struct {
 }
 
 type item struct {
-	model    apiModel
-	ver      apiVersion
-	file     apiFile
-	tag      string // base model tag, "" for types without one
-	status   string
-	note     string
-	dest     string      // where a download goes (stGet)
-	found    string      // where the file already is (stHave)
-	rename   string      // the name `found` should have to carry its tag; "" if it does
-	images   []apiImage  // preview candidates, best first
-	thumbs   []thumbJob  // previews to fetch
-	sidecars [][2]string // files that move along with a rename
+	model     apiModel
+	ver       apiVersion
+	file      apiFile
+	tag       string // base model tag, "" for types without one
+	status    string
+	note      string
+	dest      string      // where a download goes (stGet)
+	found     string      // where the file already is (stHave)
+	rename    string      // the name `found` should have to carry its tag; "" if it does
+	images    []apiImage  // preview candidates, best first
+	thumbs    []thumbJob  // previews to fetch
+	sidecars  [][2]string // files that move along with a rename
+	ea        bool        // Civitai has this version in early access right now
+	eaBlocked bool        // a download of it was refused before (recorded in the state file)
+	local     bool        // not a liked model: found on Civitai by its checksum (-local)
 }
 
 // final is where the model file is, or will be, once this run is done.
@@ -894,7 +1179,7 @@ func (it item) final(renaming bool) string {
 	case it.status == stGet:
 		return it.dest
 	case renaming && it.rename != "":
-		return filepath.Join(filepath.Dir(it.found), it.rename)
+		return it.rename
 	}
 	return it.found
 }
@@ -912,6 +1197,7 @@ type planOptions struct {
 	all      bool
 	rename   bool
 	previews int
+	unsure   map[string]bool // files that fit several liked files by name and size, with no checksum
 }
 
 type planResult struct {
@@ -965,6 +1251,9 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 	// cands are that base's versions, newest first.
 	evaluate := func(m apiModel, dir string, cands []candidate) item {
 		target := cands[0]
+		if dir == "checkpoints" && strings.EqualFold(filepath.Ext(target.file.Name), ".gguf") {
+			dir = "diffusion_models" // GGUF models load through Unet Loader (GGUF), not as checkpoints
+		}
 		it := item{model: m, ver: target.ver, file: target.file, tag: target.tag}
 		it.images = previewImages(target.ver, cands)
 		check := cands
@@ -978,28 +1267,47 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			if i > 0 {
 				it.note += fmt.Sprintf("; that is version %q, the newest is %q", cd.ver.Name, target.ver.Name)
 			}
-			if !strings.EqualFold(filepath.Base(l.path), cd.tagged) {
-				it.rename = cd.tagged
+			if want := ggufHome(idx, desiredPath(l.path, cd.tag, cd.file.Name)); !strings.EqualFold(want, l.path) {
+				it.rename = want
 			}
 			return it
 		}
 
 		// 1. On disk under its tagged name or under Civitai's own name, anywhere
 		//    in the tree, with the size agreeing.
+		//    Where both checksums are known they must agree: an SDXL and a Pony
+		//    version of a LoRA can share a name and a size.
 		for i, cd := range check {
-			for _, name := range []string{cd.tagged, cd.file.Name} {
+			for _, name := range tagForms(cd.tag, cd.file.Name) {
 				for _, l := range idx.byName[strings.ToLower(name)] {
-					if cd.file.bytes() == 0 || sizeClose(l.size, cd.file.bytes()) {
-						return have(l, cd, "", i)
+					if cd.file.bytes() != 0 && !sizeClose(l.size, cd.file.bytes()) {
+						continue
 					}
+					if want, got := cd.file.sha256(), idx.shaByPath[l.path]; want != "" && got != "" && want != got {
+						continue
+					}
+					if opt.unsure[l.path] {
+						it.status = stAlone
+						it.note = idx.rel(l.path) + " fits more than one liked file by name and size (two base models' versions?); -checksum tells which it is"
+						return it
+					}
+					return have(l, cd, "", i)
 				}
 			}
 		}
 		// 2. The name it would be saved under belongs to a different file.
-		if ls := idx.byName[strings.ToLower(target.tagged)]; len(ls) > 0 {
+		//    In folder mode the same name in another base model's folder is fine.
+		for _, l := range idx.byName[strings.ToLower(target.tagged)] {
+			if tagMode == "folder" && !noTag(target.tag) && !strings.EqualFold(filepath.Base(filepath.Dir(l.path)), target.tag) {
+				continue
+			}
 			it.status = stAlone
-			it.note = fmt.Sprintf("%s already has the name this would be saved under, with a different size (yours %s, Civitai's %s)",
-				idx.rel(ls[0].path), human(ls[0].size), human(target.file.bytes()))
+			if sizeClose(l.size, target.file.bytes()) {
+				it.note = fmt.Sprintf("%s already has the name this would be saved under, but is a different file (checksums differ)", idx.rel(l.path))
+			} else {
+				it.note = fmt.Sprintf("%s already has the name this would be saved under, with a different size (yours %s, Civitai's %s)",
+					idx.rel(l.path), human(l.size), human(target.file.bytes()))
+			}
 			return it
 		}
 		// 3. An earlier download of it that failed its checksum.
@@ -1040,7 +1348,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			}
 		}
 		// 6. Missing: download the newest version for this base model.
-		key := strings.ToLower(target.tagged)
+		key := strings.ToLower(filepath.Join(dir, tagSubdir(target.tag), target.tagged))
 		u, err := url.Parse(target.file.DownloadURL)
 		switch {
 		case err != nil || !strings.EqualFold(u.Host, c.base.Host) || u.Scheme != c.base.Scheme:
@@ -1051,9 +1359,9 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 		default:
 			planned[key] = m.Name
 			it.status = stGet
-			it.dest = filepath.Join(idx.root, dir, target.tagged)
+			it.dest = filepath.Join(idx.root, dir, tagSubdir(target.tag), target.tagged)
 			if ls := idx.byName[strings.ToLower(target.file.Name)]; len(ls) > 0 && target.tagged != target.file.Name {
-				it.note = fmt.Sprintf("%s has Civitai's name for it but a different size, so it is not this file", idx.rel(ls[0].path))
+				it.note = fmt.Sprintf("%s has Civitai's name for it but is a different file (another base model's version, or another size)", idx.rel(ls[0].path))
 			}
 		}
 		return it
@@ -1095,10 +1403,13 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			res.items = append(res.items, item{model: m, status: stSkip, note: note})
 			continue
 		}
+		if agnostic && !opt.all {
+			continue // no base model (upscalers): only handled when every base is
+		}
 		for _, tag := range order {
 			if !agnostic {
 				if !opt.all && !opt.bases[tag] {
-					res.others[tag]++
+					res.others[tag]++ // -base: not handled at all this run
 					continue
 				}
 				res.matched[tag] = true
@@ -1106,20 +1417,99 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			res.items = append(res.items, evaluate(m, dir, groups[tag]))
 		}
 	}
+	settle(res, st, idx, opt, 0)
+	return res
+}
 
-	// A file is renamed only when nothing has the new name and no other liked
-	// model lays claim to the same file or the same new name. Its previews and
-	// info files go with it.
+// checksumAmbiguous checksums the files that more than one liked file could
+// be by name and size (the same name under two base models, or two models), so
+// that plan can tell them apart. Checksums are kept in the state file.
+// Without -checksum nothing is hashed: the files are returned instead, and plan
+// leaves them alone rather than guess.
+func checksumAmbiguous(ctx context.Context, idx *index, st *stateFile, models []apiModel, hash bool) (map[string]bool, error) {
+	claims := map[string]map[string]bool{} // local path -> candidate keys that fit it
+	for _, m := range models {
+		for _, v := range m.ModelVersions {
+			f, ok := modelFile(v)
+			if !ok {
+				continue
+			}
+			tag := ""
+			if !baseAgnostic[m.Type] {
+				tag = baseTag(v.BaseModel)
+			}
+			key := fmt.Sprintf("%d/%s/%s", m.ID, tag, f.sha256())
+			for _, name := range tagForms(tag, f.Name) {
+				for _, l := range idx.byName[strings.ToLower(name)] {
+					if f.bytes() == 0 || sizeClose(l.size, f.bytes()) {
+						if claims[l.path] == nil {
+							claims[l.path] = map[string]bool{}
+						}
+						claims[l.path][key] = true
+					}
+				}
+			}
+		}
+	}
+	var todo []localFile
+	unsure := map[string]bool{}
+	for _, l := range idx.all {
+		if len(claims[l.path]) > 1 && idx.shaByPath[l.path] == "" {
+			todo = append(todo, l)
+			unsure[l.path] = true
+		}
+	}
+	if !hash {
+		return unsure, nil
+	}
+	if len(todo) > 0 {
+		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that match more than one liked file by name and size...\n", len(todo))
+	}
+	for i, l := range todo {
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(todo), idx.rel(l.path), human(l.size))
+		sum, err := hashFile(ctx, l.path)
+		if err != nil {
+			if ctx.Err() != nil {
+				st.saveOrWarn()
+				return nil, ctx.Err()
+			}
+			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
+			continue
+		}
+		if e := st.Files[idx.rel(l.path)]; e != nil {
+			e.SHA256 = sum
+		}
+		idx.byHash[sum] = append(idx.byHash[sum], l)
+		idx.shaByPath[l.path] = sum
+		st.saveOrWarn()
+	}
+	return nil, nil
+}
+
+// settle works out the renames and previews for res.items[from:]; items
+// before from have been settled already and keep their claims.
+func settle(res *planResult, st *stateFile, idx *index, opt planOptions, from int) {
+	// A file is renamed only when nothing has the new name and no other model
+	// lays claim to the same file or the same new name. Its previews and info
+	// files go with it.
 	srcTaken, dstTaken := map[string]bool{}, map[string]bool{}
-	for i := range res.items {
+	for _, it := range res.items[:from] {
+		if it.status == stHave && it.rename != "" {
+			srcTaken[it.found], dstTaken[strings.ToLower(it.rename)] = true, true
+			for _, sc := range it.sidecars {
+				dstTaken[strings.ToLower(sc[1])] = true
+			}
+		}
+	}
+	for i := from; i < len(res.items); i++ {
 		it := &res.items[i]
 		if it.status != stHave || it.rename == "" {
 			continue
 		}
-		to := filepath.Join(filepath.Dir(it.found), it.rename)
+		to := it.rename
 		_, err := os.Lstat(to)
 		if err == nil || srcTaken[it.found] || dstTaken[strings.ToLower(to)] {
-			it.note += fmt.Sprintf("; cannot be renamed, %s is taken", it.rename)
+			it.note += fmt.Sprintf("; cannot be renamed, %s is taken", idx.rel(it.rename))
 			it.rename = ""
 			continue
 		}
@@ -1139,7 +1529,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 	// Previews: for every file kept or downloaded, fill the preview slots that
 	// are empty with images not already saved for it.
 	if opt.previews > 0 {
-		for i := range res.items {
+		for i := from; i < len(res.items); i++ {
 			it := &res.items[i]
 			if it.status != stHave && it.status != stGet {
 				continue
@@ -1172,7 +1562,326 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			}
 		}
 	}
-	return res
+}
+
+// ------------------------------------------------------------- local files
+
+// Folders whose files -local looks up on Civitai. Upscalers have no base
+// model; text encoders and the like are not Civitai models and are big.
+var localDirs = map[string]bool{"checkpoints": true, "loras": true, "diffusion_models": true, "unet": true,
+	"embeddings": true, "controlnet": true, "hypernetworks": true, "vae": true, "animatediff_models": true}
+
+// hashVersion is what Civitai returns for a file looked up by its checksum.
+type hashVersion struct {
+	apiVersion
+	ModelID int64 `json:"modelId"`
+	Model   struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	} `json:"model"`
+}
+
+// versionByHash asks Civitai which model version a file is; nil when Civitai
+// does not know the file.
+func (c *client) versionByHash(ctx context.Context, sha string) (*hashVersion, error) {
+	var v hashVersion
+	err := c.getJSON(ctx, c.base.String()+"/api/v1/model-versions/by-hash/"+url.PathEscape(sha), &v)
+	var he *httpError
+	if errors.As(err, &he) && he.status == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// untag strips a tag the name already carries in any -tag form, so a file
+// that was tagged one way can be retagged another.
+func untag(tag, name string) string {
+	stem, ext := strings.TrimSuffix(name, filepath.Ext(name)), filepath.Ext(name)
+	low := strings.ToLower(stem)
+	switch {
+	case len(stem) > len(tag)+1 && strings.HasPrefix(low, tag+"_"):
+		stem = stem[len(tag)+1:]
+	case len(stem) > len(tag)+1 && (strings.HasSuffix(low, "_"+tag) || strings.HasSuffix(low, "."+tag)):
+		stem = stem[:len(stem)-len(tag)-1]
+	}
+	return stem + ext
+}
+
+type leftFile struct{ rel, why string }
+
+type localStats struct {
+	found, guessed, failed int
+	left                   []leftFile // model files still without a known base, and why
+	notLooked              int        // -local off: files no liked model accounts for, base unknown
+}
+
+// guessBase reads the base model from a safetensors file's own metadata, as
+// trainers write it (ss_base_model_version, modelspec.architecture). Only what
+// the metadata states is used, never a guess from the tensor layout.
+func guessBase(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".safetensors" && ext != ".sft" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var n uint64
+	if err := binary.Read(f, binary.LittleEndian, &n); err != nil || n == 0 || n > 64<<20 {
+		return ""
+	}
+	var header struct {
+		Meta map[string]any `json:"__metadata__"`
+	}
+	if err := json.NewDecoder(io.LimitReader(f, int64(n))).Decode(&header); err != nil {
+		return ""
+	}
+	str := func(k string) string {
+		v, _ := header.Meta[k].(string)
+		return strings.ToLower(v)
+	}
+	for _, text := range []string{str("modelspec.architecture"), str("ss_base_model_version")} {
+		switch {
+		case text == "":
+		case strings.Contains(text, "krea") && strings.Contains(text, "2"):
+			return "krea2"
+		case strings.Contains(text, "schnell"):
+			return "flux1_schnell"
+		case strings.Contains(text, "flux-2") || strings.Contains(text, "flux2"):
+			return "flux2_dev"
+		case strings.Contains(text, "flux"):
+			return "flux1_dev"
+		case strings.Contains(text, "xl"):
+			return "sdxl1"
+		case strings.Contains(text, "qwen"):
+			return "qwen"
+		case strings.Contains(text, "v1"):
+			return "sd1"
+		}
+	}
+	return ""
+}
+
+// ggufHome moves a .gguf diffusion model out of checkpoints: ComfyUI loads
+// GGUF models from diffusion_models (Unet Loader (GGUF)), not as checkpoints.
+func ggufHome(idx *index, path string) string {
+	if !strings.EqualFold(filepath.Ext(path), ".gguf") {
+		return path
+	}
+	rel := filepath.ToSlash(idx.rel(path))
+	if top, rest, ok := strings.Cut(rel, "/"); ok && top == "checkpoints" {
+		return filepath.Join(idx.root, "diffusion_models", filepath.FromSlash(rest))
+	}
+	return path
+}
+
+// carriesTag says whether a file name already has one of the tags in it, in
+// any -tag form, or sits in a tag folder.
+func carriesTag(path string, tags map[string]bool) bool {
+	stem := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	dir := strings.ToLower(filepath.Base(filepath.Dir(path)))
+	for t := range tags {
+		if noTag(t) {
+			continue
+		}
+		if dir == t || strings.HasPrefix(stem, t+"_") || strings.HasSuffix(stem, "_"+t) || strings.HasSuffix(stem, "."+t) {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupLocal deals with model files that no liked model accounts for. With
+// -local it asks Civitai what they are by checksum, so they can be tagged and
+// previewed like the rest; with -guess, files Civitai does not know are tagged
+// from their own metadata. Checksums and answers are kept in the state file:
+// a file is checksummed once, and one Civitai does not know is not asked about
+// again until it changes. Whatever is left without a base is listed, with why.
+func lookupLocal(ctx context.Context, c *client, idx *index, st *stateFile, res *planResult, opt planOptions, enabled, guess bool) (localStats, error) {
+	var ls localStats
+	claimed := map[string]bool{}
+	for _, it := range res.items {
+		if it.found != "" {
+			claimed[it.found] = true
+		}
+	}
+	known := map[string]bool{} // every tag the tool could have put in a name
+	for t := range opt.bases {
+		known[t] = true
+	}
+	for t := range res.names {
+		known[t] = true
+	}
+	for t := range knownTags {
+		known[t] = true
+	}
+	var todo []localFile
+	for _, l := range idx.all {
+		rel := idx.rel(l.path)
+		top, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+		if !isModelFile(l.path) || claimed[l.path] || !localDirs[top] || st.Files[rel] == nil {
+			continue
+		}
+		todo = append(todo, l)
+	}
+
+	if enabled {
+		// Checksum what has none yet.
+		var hashN int
+		var hashBytes int64
+		need := func(e *fileState) bool { return e.SHA256 == "" && !e.NotOnCivitai && e.VersionID == 0 }
+		for _, l := range todo {
+			if need(st.Files[idx.rel(l.path)]) {
+				hashN++
+				hashBytes += l.size
+			}
+		}
+		if hashN > 0 {
+			fmt.Fprintf(os.Stderr, "Checksumming %d model file(s) no liked model accounts for, %s, to look them up on Civitai...\n", hashN, human(hashBytes))
+		}
+		done := 0
+		for _, l := range todo {
+			e := st.Files[idx.rel(l.path)]
+			if !need(e) {
+				continue
+			}
+			done++
+			fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", done, hashN, idx.rel(l.path), human(l.size))
+			sum, err := hashFile(ctx, l.path)
+			if err != nil {
+				if ctx.Err() != nil {
+					st.saveOrWarn()
+					return ls, ctx.Err()
+				}
+				fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
+				continue
+			}
+			e.SHA256 = sum
+			st.saveOrWarn()
+		}
+	}
+
+	from := len(res.items)
+	for _, l := range todo {
+		rel := idx.rel(l.path)
+		e := st.Files[rel]
+		var v *hashVersion
+		why := ""
+		switch {
+		case e.VersionID != 0 && (!enabled || e.Base == "" || opt.previews == 0 || previewExists(l.path, opt.previews)):
+			// Known from an earlier run and nothing to fetch: no need to ask.
+			v = &hashVersion{apiVersion: apiVersion{ID: e.VersionID, BaseModel: e.BaseName}}
+			v.Model.Name, v.Model.Type = e.Model, e.ModelType
+		case !enabled:
+			why = "not looked up on Civitai (-local does that)"
+		case e.NotOnCivitai:
+			why = "Civitai does not know it (nothing there has this checksum)"
+		case e.SHA256 == "":
+			why = "could not be checksummed"
+		default:
+			var err error
+			v, err = c.versionByHash(ctx, e.SHA256)
+			if ctx.Err() != nil {
+				return ls, ctx.Err()
+			}
+			switch {
+			case err != nil:
+				why = "the Civitai lookup failed (" + err.Error() + "); the next run tries again"
+				ls.failed++
+			case v == nil:
+				e.NotOnCivitai = true
+				why = "Civitai does not know it (nothing there has this checksum)"
+			}
+		}
+		tag, how := "", ""
+		if v != nil {
+			e.VersionID, e.ModelType, e.Model, e.BaseName = v.ID, v.Model.Type, v.Model.Name, strings.TrimSpace(v.BaseModel)
+			t := baseTag(v.BaseModel)
+			if baseAgnostic[v.Model.Type] || noTag(t) {
+				e.Base = ""
+				why = fmt.Sprintf("Civitai has it (%s) but gives it no base model", v.Model.Name)
+				v = nil
+			} else {
+				tag, how = t, "found on Civitai by checksum; not a liked model"
+				e.Base = t
+				ls.found++
+			}
+		}
+		if tag == "" && e.Base != "" && e.VersionID == 0 && e.NotOnCivitai && !guess {
+			e.Base = "" // a -guess from an earlier run, not wanted now
+		}
+		if tag == "" && guess && !strings.HasPrefix(why, "the Civitai lookup failed") {
+			if g := guessBase(l.path); g != "" {
+				tag, how = g, "base model from the file's own metadata (-guess)"
+				ls.guessed++
+			} else if why != "" {
+				why += "; its metadata names no base model either"
+			}
+		}
+		if tag != "" && !opt.all && !opt.bases[tag] {
+			continue // another base model than -base asks for: not handled this run
+		}
+		if tag == "" {
+			if !carriesTag(l.path, known) {
+				ls.left = append(ls.left, leftFile{rel, why})
+				if !enabled {
+					ls.notLooked++
+				}
+			}
+			continue
+		}
+		if res.names[tag] == "" {
+			res.names[tag] = e.BaseName
+		}
+		knownTags[tag] = true
+		name := strings.TrimSuffix(filepath.Base(l.path), filepath.Ext(l.path))
+		it := item{tag: tag, status: stHave, found: l.path, local: true}
+		it.model = apiModel{Name: name}
+		if v != nil {
+			it.model = apiModel{ID: v.ModelID, Name: v.Model.Name, Type: v.Model.Type}
+			it.ver = v.apiVersion
+			it.images = previewImages(v.apiVersion, nil)
+		}
+		it.note = rel + " (" + how + ")"
+		want := ggufHome(idx, desiredPath(l.path, tag, untag(tag, filepath.Base(l.path))))
+		if !strings.EqualFold(want, l.path) {
+			it.rename = want
+		}
+		res.items = append(res.items, it)
+	}
+	st.saveOrWarn()
+	settle(res, st, idx, opt, from)
+	return ls, nil
+}
+
+// oddNames lists files whose name has a model extension in the middle, the
+// usual result of a rename gone wrong: ComfyUI does not list them.
+func oddNames(idx *index) []string {
+	var out []string
+	for _, l := range idx.all {
+		name := strings.ToLower(filepath.Base(l.path))
+		if isModelFile(l.path) {
+			continue
+		}
+		for ext := range modelExts {
+			i := strings.Index(name, ext)
+			if i < 0 {
+				continue
+			}
+			rest := name[i+len(ext):]
+			if rest != "" && rest[0] != '.' { // ".part", ".json" and the like are fine
+				out = append(out, idx.rel(l.path))
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------- download
@@ -1319,13 +2028,43 @@ func (c *client) fetch(ctx context.Context, it item, tty bool) (string, error) {
 			bad := it.dest + ".unverified"
 			os.Remove(bad)
 			os.Rename(part, bad)
-			return "", fmt.Errorf("%w: kept as %s, not under its real name", errChecksum, filepath.Base(bad))
+			return "", fmt.Errorf("%w: kept as %s, not under its real name\n    %s", errChecksum, filepath.Base(bad),
+				mismatchDetail(it, got, pr.done, resp.Header.Get("Content-Disposition")))
 		}
 	}
 	if _, err := os.Lstat(it.dest); err == nil {
 		return "", fmt.Errorf("%s appeared while downloading; the new copy stays as %s", it.dest, filepath.Base(part))
 	}
 	return got, os.Rename(part, it.dest)
+}
+
+// mismatchDetail says what came instead of the file asked for: the name
+// Civitai gave it, its size against the expected size, and whether it is in
+// fact another file of the same model.
+func mismatchDetail(it item, got string, size int64, disposition string) string {
+	sent := ""
+	if _, params, err := mime.ParseMediaType(disposition); err == nil {
+		sent = params["filename"]
+	}
+	var parts []string
+	if sent != "" && !strings.EqualFold(sent, it.file.Name) {
+		parts = append(parts, fmt.Sprintf("Civitai sent %q when asked for %q", sent, it.file.Name))
+	}
+	for _, v := range it.model.ModelVersions {
+		for _, f := range v.Files {
+			if f.sha256() == got && f.Name != it.file.Name {
+				parts = append(parts, fmt.Sprintf("what came is %q of version %q (Civitai's download link mixes these files up)", f.Name, v.Name))
+			}
+		}
+	}
+	want := it.file.bytes()
+	switch {
+	case want > 0 && !sizeClose(size, want):
+		parts = append(parts, fmt.Sprintf("it is %s where Civitai lists %s", human(size), human(want)))
+	case len(parts) == 0:
+		parts = append(parts, "right size, wrong content: damaged on the way, or Civitai's checksum for it is out of date")
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (c *client) fetchWithRetry(ctx context.Context, it item, tty bool) (string, error) {
@@ -1431,32 +2170,175 @@ func sortedKeys(m map[string]bool) []string {
 	return keys
 }
 
+// ------------------------------------------------------------------ config
+
+func defaultConfigPath(home string) string {
+	if d, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(d, "civitai-likes", "config")
+	}
+	return filepath.Join(home, ".config", "civitai-likes", "config")
+}
+
+// applyConfig sets every flag the config file names, unless the same flag
+// was given on the command line. Format: "flag = value" per line, # comments.
+// A missing file is fine; a bad line is an error naming the line.
+func applyConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("config %s: %v", path, err)
+	}
+	onCLI := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { onCLI[f.Name] = true })
+	for n, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		key = strings.TrimLeft(strings.TrimSpace(key), "-")
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if !ok {
+			key, val = strings.TrimLeft(line, "-"), "true" // a bare boolean flag
+		}
+		if key == "config" || key == "print-config" {
+			return fmt.Errorf("config %s line %d: %q cannot be set in the config file", path, n+1, key)
+		}
+		if flag.Lookup(key) == nil {
+			return fmt.Errorf("config %s line %d: no flag called %q (civitai-likes -h lists them)", path, n+1, key)
+		}
+		if onCLI[key] {
+			continue
+		}
+		if err := flag.Set(key, val); err != nil {
+			return fmt.Errorf("config %s line %d: %s = %s: %v", path, n+1, key, val, err)
+		}
+	}
+	return nil
+}
+
+// writeConfig prints the settings in effect as a config file.
+func writeConfig(w io.Writer, path string) {
+	fmt.Fprintf(w, "# civitai-likes config (%s)\n", path)
+	fmt.Fprintln(w, "# flag = value; flags given on the command line win. Booleans: true / false.")
+	flag.VisitAll(func(f *flag.Flag) {
+		if f.Name == "config" || f.Name == "print-config" {
+			return
+		}
+		usage := strings.ReplaceAll(f.Usage, "\n", "\n# ")
+		fmt.Fprintf(w, "\n# %s\n%s = %s\n", usage, f.Name, f.Value.String())
+	})
+}
+
+// baseTally counts what a run found for one base model's liked files.
+type baseTally struct{ have, get, wait, alone int }
+
+func tallyBases(items []item) map[string]*baseTally {
+	per := map[string]*baseTally{}
+	for _, it := range items {
+		if it.local || it.tag == "" {
+			continue
+		}
+		c := per[it.tag]
+		if c == nil {
+			c = &baseTally{}
+			per[it.tag] = c
+		}
+		switch it.status {
+		case stHave:
+			c.have++
+		case stGet:
+			c.get++
+		case stWait:
+			c.wait++
+		case stAlone:
+			c.alone++
+		}
+	}
+	return per
+}
+
 func run() int {
 	home, _ := os.UserHomeDir()
 	modelsDir := flag.String("models", filepath.Join(home, "ComfyUI", "models"), "ComfyUI models folder")
 	dryRun := flag.Bool("n", false, "show what would happen; change nothing")
 	yes := flag.Bool("yes", false, "go ahead without asking")
-	baseSpec := flag.String("base", defaultBases, "base models to fetch, comma separated, as tags (flux1_dev) or\n"+
-		"Civitai names (\"Flux.1 D\"); \"+pony,+illustrious\" adds to the defaults; \"all\" takes every base")
+	baseSpec := flag.String("base", "all", "base models to handle (download, rename, preview), comma separated, as tags\n"+
+		"(flux1_dev) or Civitai names (\"Flux.1 D\"); \"all\" (the default) handles every base")
 	rename := flag.Bool("rename", false, "rename files you already have so their names start with the base model tag")
 	previews := flag.Int("previews", 1, "preview images to keep per model file; the first is the one ComfyUI shows,\n"+
 		"extras are saved as <name>.preview-2.jpg and so on for you to choose from (0 = none)")
+	renameOnly := flag.Bool("rename-only", false, "only rename model files you already have to the tagged form (liked models of any\n"+
+		"base; with -local, other files too)\n"+
+		"(their previews and info files go with them); no downloads, no previews")
 	previewsOnly := flag.Bool("previews-only", false, "only fetch missing previews for liked models you already have, up to\n"+
 		"-previews per file; no model downloads or renames")
-	checksum := flag.Bool("checksum", false, "checksum every model file that has no checksum on record (slow; normally\n"+
-		"only files new or changed since the last run are checksummed)")
+	eaRetry := flag.Bool("ea", false, "retry early access versions Civitai refused before, without waiting for their\n"+
+		"early access to end (for ones you have since paid for); on its own, only those")
+	eaAll := flag.Bool("all", false, "with -ea: also do everything a normal run does")
+	checksum := flag.Bool("checksum", false, "checksum every model file that has no checksum on record (slow, once per file).\n"+
+		"Otherwise only downloads are checksummed (and -local files); checksums catch copies\n"+
+		"under other names and tell apart files that share a name and size")
+	local := flag.Bool("local", false, "also look up model files that are not liked models on Civitai by checksum, so they\n"+
+		"get tagged and previewed too (the first run checksums them all, which is slow)")
+	guess := flag.Bool("guess", false, "tag model files Civitai does not know (your own trainings, files from elsewhere)\n"+
+		"by the base model their own metadata names, when it names one")
 	latest := flag.Bool("latest", false, "fetch the newest version even when an older version is on disk")
 	maxModels := flag.Int("max", 1000, "refuse to act on a likes list longer than this")
 	stateOpt := flag.String("state", "", "state file (default <models>/.civitai-likes.json)")
 	tokenFile := flag.String("token-file", filepath.Join(home, ".config", "civitai", "token"), "file holding the API token")
 	apiBase := flag.String("api", "https://civitai.com", "Civitai base URL")
+	tagFlag := flag.String("tag", "front", "where the base model tag goes in file names:\n"+
+		"  front   flux1_dev_name.safetensors\n"+
+		"  end     name_flux1_dev.safetensors\n"+
+		"  dot     name.flux1_dev.safetensors\n"+
+		"  folder  loras/flux1_dev/name.safetensors\n"+
+		"  none    Civitai's name, untouched")
+	configPath := flag.String("config", defaultConfigPath(home), "config file with default flags (command-line flags override it)")
+	printConfig := flag.Bool("print-config", false, "print the settings in effect, in config file form, and exit")
 	flag.Parse()
+	if err := applyConfig(*configPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if *printConfig {
+		writeConfig(os.Stdout, *configPath)
+		return 0
+	}
+	tagMode = strings.ToLower(strings.TrimSpace(*tagFlag))
+	if !slices.Contains(tagModes, tagMode) {
+		fmt.Fprintf(os.Stderr, "-tag must be one of %s\n", strings.Join(tagModes, ", "))
+		return 2
+	}
 	if flag.NArg() > 0 {
 		fmt.Fprintln(os.Stderr, "unexpected argument:", flag.Arg(0))
 		return 2
 	}
 	if *previews < 0 {
 		*previews = 0
+	}
+	if *eaAll && !*eaRetry {
+		fmt.Fprintln(os.Stderr, "note: -all only means something together with -ea; ignored")
+		*eaAll = false
+	}
+	eaOnly := *eaRetry && !*eaAll
+	if *renameOnly {
+		if *previewsOnly || *eaRetry {
+			fmt.Fprintln(os.Stderr, "-rename-only does not go together with -previews-only or -ea")
+			return 2
+		}
+		*rename = true
+		*previews = 0
+	}
+	if *previewsOnly && *eaRetry {
+		fmt.Fprintln(os.Stderr, "-previews-only and -ea do not go together")
+		return 2
+	}
+	if eaOnly && *rename {
+		fmt.Fprintln(os.Stderr, "note: -rename is ignored with -ea on its own (add -all for a full run)")
+		*rename = false
 	}
 	if *previewsOnly {
 		if *previews == 0 {
@@ -1544,20 +2426,76 @@ func run() int {
 		fmt.Println("Base models:", strings.Join(sortedKeys(opt.bases), ", "))
 	}
 	if !st.existed {
-		fmt.Println("First run: file sizes and dates recorded. From the next run on, model files that are new")
-		fmt.Println("or changed are checksummed automatically; -checksum does every file now (slow).")
+		fmt.Println("First run: file sizes and dates recorded. Nothing is checksummed except downloads;")
+		fmt.Println("-checksum checksums what you have (slow, once per file) to catch copies under other names.")
 	}
 
+	for t := range opt.bases {
+		knownTags[t] = true
+	}
+	for _, m := range models {
+		for _, v := range m.ModelVersions {
+			if t := baseTag(v.BaseModel); !noTag(t) && v.BaseModel != "" {
+				knownTags[t] = true
+			}
+		}
+	}
+	if opt.unsure, err = checksumAmbiguous(ctx, idx, st, models, *checksum); err != nil {
+		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
+		return 130
+	}
 	res := plan(c, idx, st, models, opt)
+	ls, err := lookupLocal(ctx, c, idx, st, res, opt, *local && !eaOnly, *guess && !eaOnly)
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
+			return 130
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	for _, it := range res.items {
+		if it.status == stHave {
+			st.setBase(idx, it.found, it, res.names[it.tag])
+		}
+	}
+	st.saveOrWarn()
+	tallies := tallyBases(res.items) // before anything is filtered out of the list
 	items := res.items
 	notOnDisk := 0
-	if *previewsOnly {
+	if *previewsOnly || *renameOnly {
 		// Nothing gets downloaded, so only files already on disk matter.
 		kept := items[:0]
 		for _, it := range items {
 			if it.status == stGet {
 				notOnDisk++
 				continue
+			}
+			kept = append(kept, it)
+		}
+		items = kept
+	}
+	notRetried := 0
+	if !*previewsOnly && !*renameOnly {
+		applyEarlyAccess(ctx, c, st, items, *eaRetry, time.Now())
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\nInterrupted.")
+			return 130
+		}
+		tallies = tallyBases(items) // now with what is held back
+
+	}
+	if eaOnly {
+		// Only the early access versions refused before; everything else waits
+		// for a normal run (or -ea -all).
+		kept := items[:0]
+		for _, it := range items {
+			switch {
+			case it.status == stGet && !it.eaBlocked:
+				notRetried++
+				continue
+			case it.status == stHave:
+				it.thumbs, it.rename = nil, ""
 			}
 			kept = append(kept, it)
 		}
@@ -1577,14 +2515,50 @@ func run() int {
 			untagged++
 		}
 	}
-	if *previewsOnly {
+	if *renameOnly {
+		haveN, blocked := 0, 0
+		for _, it := range items {
+			if it.status == stHave {
+				haveN++
+				if strings.Contains(it.note, "cannot be renamed") {
+					blocked++
+				}
+			}
+		}
+		fmt.Printf("\nRename only. Liked model files on disk: %d", haveN-ls.found)
+		if notOnDisk > 0 {
+			fmt.Printf("; not on disk, so skipped: %d", notOnDisk)
+		}
+		fmt.Println(".")
+		if blocked > 0 {
+			fmt.Printf("\nCannot be renamed (%d):\n", blocked)
+			for _, it := range items {
+				if it.status == stHave && strings.Contains(it.note, "cannot be renamed") {
+					fmt.Printf("  %s  ->  %s\n", label(it), it.note)
+				}
+			}
+		}
+	}
+	if *renameOnly || *previewsOnly {
+		var unsure []string
+		for _, it := range items {
+			if it.status == stAlone && strings.Contains(it.note, "-checksum tells") {
+				unsure = append(unsure, fmt.Sprintf("  %s: %s", label(it), it.note))
+			}
+		}
+		if len(unsure) > 0 {
+			fmt.Printf("\nLeft alone, not sure which liked file they are (%d):\n%s\n", len(unsure), strings.Join(unsure, "\n"))
+		}
+	}
+	if *renameOnly {
+	} else if *previewsOnly {
 		haveN := 0
 		for _, it := range items {
 			if it.status == stHave {
 				haveN++
 			}
 		}
-		fmt.Printf("\nPreviews only, up to %d per file. Liked model files on disk: %d", *previews, haveN)
+		fmt.Printf("\nPreviews only, up to %d per file. Liked model files on disk: %d", *previews, haveN-ls.found)
 		if notOnDisk > 0 {
 			fmt.Printf("; not on disk, so skipped: %d", notOnDisk)
 		}
@@ -1600,7 +2574,17 @@ func run() int {
 			return fmt.Sprintf("%s: %s", label(it), it.note)
 		})
 	}
-	if len(res.others) > 0 && !*previewsOnly {
+	printGroup("Refused before, held back (-ea retries now)", items, stWait, func(it item) string {
+		return fmt.Sprintf("%s%s: %s", label(it), versionLabel(it.ver), it.note)
+	})
+	if eaOnly {
+		fmt.Printf("\n-ea on its own: only early access versions refused before are retried")
+		if notRetried > 0 {
+			fmt.Printf("; %d other missing file(s) left for a normal run", notRetried)
+		}
+		fmt.Println(".")
+	}
+	if len(res.others) > 0 && !*previewsOnly && !*renameOnly {
 		tags := make([]string, 0, len(res.others))
 		for t := range res.others {
 			tags = append(tags, t)
@@ -1632,6 +2616,72 @@ func run() int {
 		}
 	}
 
+	if (*local || *guess) && !eaOnly {
+		var parts []string
+		if *local {
+			parts = append(parts, fmt.Sprintf("%d found on Civitai by checksum", ls.found))
+		}
+		if *guess {
+			parts = append(parts, fmt.Sprintf("%d tagged from their own metadata", ls.guessed))
+		}
+		fmt.Printf("\nOther model files: %s.\n", strings.Join(parts, ", "))
+		if len(ls.left) > 0 {
+			fmt.Printf("\nLeft untagged, base model unknown (%d):\n", len(ls.left))
+			for _, lf := range ls.left {
+				fmt.Printf("  %s\n      %s\n", lf.rel, lf.why)
+			}
+			if !*guess {
+				fmt.Println("  (-guess tags the ones whose own metadata names a base model)")
+			}
+		}
+	} else if ls.notLooked > 0 && (*rename || *renameOnly) {
+		fmt.Printf("\n%d other model file(s) are not liked models, so their base model is unknown; -local looks them up on Civitai by checksum.\n", ls.notLooked)
+	}
+	var unverified []string
+	for _, l := range idx.all {
+		if strings.HasSuffix(l.path, ".unverified") {
+			unverified = append(unverified, idx.rel(l.path))
+		}
+	}
+	if len(unverified) > 0 {
+		fmt.Printf("\nDownloads that failed their checksum (%d), kept aside and hidden from ComfyUI:\n", len(unverified))
+		for _, u := range unverified {
+			fmt.Printf("  %s\n", u)
+		}
+		fmt.Println("  Delete one and run again to re-download it; the error then says what Civitai sent.")
+	}
+	if odd := oddNames(idx); len(odd) > 0 {
+		fmt.Printf("\nMangled names, hidden from ComfyUI (the extension is not at the end; fix these by hand):\n")
+		for _, o := range odd {
+			fmt.Printf("  %q\n", o)
+		}
+	}
+
+	if !opt.all && !eaOnly {
+		fmt.Println("\nPer base model (liked files):")
+		for _, t := range sortedKeys(opt.bases) {
+			c := tallies[t]
+			if c == nil {
+				c = &baseTally{}
+			}
+			if c.have+c.get+c.wait+c.alone == 0 {
+				fmt.Printf("  %-16s none liked (check the tag: the full list of tags in your likes is printed by -base all -n)\n", t)
+				continue
+			}
+			line := fmt.Sprintf("  %-16s %d on disk, %d to download", t, c.have, c.get)
+			if *renameOnly || *previewsOnly {
+				line = fmt.Sprintf("  %-16s %d on disk (%d not on disk, not downloaded in this mode)", t, c.have, c.get)
+			}
+			if c.wait > 0 {
+				line += fmt.Sprintf(", %d held back (refused before)", c.wait)
+			}
+			if c.alone > 0 {
+				line += fmt.Sprintf(", %d left alone (see above)", c.alone)
+			}
+			fmt.Println(line)
+		}
+	}
+
 	renames := 0
 	if *rename {
 		renames = untagged
@@ -1643,7 +2693,7 @@ func run() int {
 					if n := len(it.sidecars); n > 0 {
 						extra = fmt.Sprintf("  (+%d preview/info file(s))", n)
 					}
-					fmt.Printf("  %s  ->  %s%s\n", idx.rel(it.found), it.rename, extra)
+					fmt.Printf("  %s  ->  %s%s\n", idx.rel(it.found), idx.rel(it.rename), extra)
 				}
 			}
 		}
@@ -1688,6 +2738,9 @@ func run() int {
 		if it.tag != "" {
 			kind += ", " + it.tag
 		}
+		if it.ea {
+			kind += ", early access until " + eaUntil(it.ver.EarlyAccessEndsAt)
+		}
 		line := fmt.Sprintf("%s%s [%s]  ->  %s  (%s)", it.model.Name, versionLabel(it.ver),
 			kind, idx.rel(it.dest), human(it.file.bytes()))
 		if n := len(it.thumbs); n > 0 {
@@ -1699,8 +2752,12 @@ func run() int {
 		return line
 	})
 	if count == 0 && renames == 0 && thumbsHave == 0 {
+		if *renameOnly {
+			fmt.Printf("\nEvery model file it knows the base of is already named for -tag %s.\n", tagMode)
+			return 0
+		}
 		if *previewsOnly {
-			fmt.Printf("\nEvery liked model file on disk already has its %d preview(s), or Civitai has no more to offer.\n", *previews)
+			fmt.Printf("\nEvery model file it knows on Civitai already has its %d preview(s), or Civitai has no more to offer.\n", *previews)
 			return 0
 		}
 		fmt.Println("\nNothing to do.")
@@ -1774,7 +2831,11 @@ func run() int {
 			if it.status != stHave || it.rename == "" {
 				continue
 			}
-			to := filepath.Join(filepath.Dir(it.found), it.rename)
+			to := it.rename
+			if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+				failed = append(failed, fmt.Sprintf("rename %s: %v", idx.rel(it.found), err))
+				continue
+			}
 			if _, err := os.Lstat(to); err == nil {
 				failed = append(failed, fmt.Sprintf("rename %s: %s already exists", idx.rel(it.found), idx.rel(to)))
 				continue
@@ -1787,7 +2848,10 @@ func run() int {
 				delete(st.Files, idx.rel(it.found))
 				st.Files[idx.rel(to)] = e
 			}
-			fmt.Printf("renamed %s  ->  %s\n", idx.rel(it.found), it.rename)
+			fmt.Printf("renamed %s  ->  %s\n", idx.rel(it.found), idx.rel(to))
+			if old := filepath.Dir(it.found); isTagDir(old) && !strings.EqualFold(old, filepath.Dir(to)) {
+				os.Remove(old) // a tag folder left empty; fails harmlessly if anything is still in it
+			}
 			for _, sc := range it.sidecars {
 				if _, err := os.Lstat(sc[1]); err == nil {
 					continue
@@ -1815,7 +2879,7 @@ func run() int {
 	}
 
 	tty := isTerminal(os.Stderr)
-	ok, done := 0, 0
+	ok, done, eaNoted := 0, 0, 0
 	for _, it := range items {
 		if it.status != stGet {
 			continue
@@ -1827,11 +2891,31 @@ func run() int {
 			fmt.Fprintln(os.Stderr, "\nInterrupted. The partial file is kept and the next run resumes it.")
 			return 130
 		}
+		vid := strconv.FormatInt(it.ver.ID, 10)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "    FAILED: %v\n", err)
-			failed = append(failed, fmt.Sprintf("%s: %v", label(it), err))
+			if blockedByAccess(err) {
+				prev := st.EarlyAccess[vid]
+				rec := &eaRecord{Model: it.model.Name, Version: it.ver.Name, Tag: it.tag, Reason: err.Error(),
+					BlockedAt: time.Now().UTC(), EndsAt: it.ver.EarlyAccessEndsAt,
+					Availability: it.ver.Availability, UsageControl: it.ver.UsageControl}
+				if rec.EndsAt == "" && prev != nil {
+					rec.EndsAt = prev.EndsAt
+				}
+				st.EarlyAccess[vid] = rec
+				eaNoted++
+				if _, ok := parseTime(rec.EndsAt); ok && it.ea {
+					fmt.Fprintf(os.Stderr, "    refused: not tried again until early access ends (%s), or with -ea\n", eaUntil(rec.EndsAt))
+				} else {
+					fmt.Fprintln(os.Stderr, "    refused: noted, not tried again until you run with -ea")
+				}
+				st.saveOrWarn()
+			} else {
+				failed = append(failed, fmt.Sprintf("%s: %v", label(it), err))
+			}
 			continue
 		}
+		delete(st.EarlyAccess, vid)
 		ok++
 		if it.file.sha256() != "" {
 			fmt.Println("    saved, checksum verified")
@@ -1839,6 +2923,7 @@ func run() int {
 			fmt.Println("    saved (Civitai gave no checksum to verify it against)")
 		}
 		st.record(idx, it.dest, sum)
+		st.setBase(idx, it.dest, it, res.names[it.tag])
 		got += fetchThumbs(it)
 	}
 	st.saveOrWarn()
@@ -1849,6 +2934,9 @@ func run() int {
 		fmt.Printf(" Previews saved: %d.", got)
 	}
 	fmt.Println()
+	if eaNoted > 0 {
+		fmt.Printf("Refused by Civitai: %d, noted in the state file and held back (until early access ends, if Civitai gives a date; -ea retries).\n", eaNoted)
+	}
 	if len(failed) > 0 {
 		fmt.Println("Failed:")
 		for _, f := range failed {

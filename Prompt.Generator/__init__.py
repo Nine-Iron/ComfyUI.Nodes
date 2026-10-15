@@ -21,6 +21,11 @@ LLM Prompt
     image). They come from the environment or a keys file:
         ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_COMPATIBLE_API_KEY
         or <this folder>/keys.json  {"anthropic": "...", "openai": "...", "openai_compatible": "..."}
+    A key is only sent to its provider's own host (api.anthropic.com,
+    api.openai.com, 127.0.0.1 for openai_compatible). Other hosts, such as a
+    proxy or OpenRouter, must be listed outside the workflow:
+        ANTHROPIC_KEY_HOSTS / OPENAI_KEY_HOSTS / OPENAI_COMPATIBLE_KEY_HOSTS
+        or keys.json  {"key_hosts": {"openai_compatible": ["openrouter.ai"]}}
 
 Install: copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 No dependencies beyond ComfyUI itself.
@@ -31,6 +36,7 @@ import os
 import random
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import folder_paths
@@ -192,6 +198,12 @@ DEFAULTS = {
 }
 ENV_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
             "openai_compatible": "OPENAI_COMPATIBLE_API_KEY"}
+# Extra hosts a provider's key may be sent to, beyond its default one. Only from
+# the environment or keys.json, never from the workflow: workflows travel inside
+# images, and a base_url in one could otherwise send your key anywhere.
+ENV_HOSTS = {"anthropic": "ANTHROPIC_KEY_HOSTS", "openai": "OPENAI_KEY_HOSTS",
+             "openai_compatible": "OPENAI_COMPATIBLE_KEY_HOSTS"}
+LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 STYLES = {
     "natural sentences (Flux, Qwen, Krea, SD3)":
@@ -205,22 +217,66 @@ SYSTEM = ("You write prompts for text-to-image models. {style} Reply with the pr
           "no quotes, no title, no explanation, no markdown.")
 
 
+def _keys_file():
+    try:
+        with open(os.path.join(HERE, "keys.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def api_key(provider):
     key = os.environ.get(ENV_KEYS[provider], "").strip()
     if key:
         return key
+    return str(_keys_file().get(provider) or "").strip()
+
+
+def _host(url):
     try:
-        with open(os.path.join(HERE, "keys.json"), encoding="utf-8") as f:
-            return str(json.load(f).get(provider, "")).strip()
-    except (OSError, ValueError, AttributeError):
+        return (urllib.parse.urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
         return ""
+
+
+def key_hosts(provider):
+    """Hosts this provider's key may go to: its default host plus the configured extras."""
+    hosts = {_host(DEFAULTS[provider][0])}
+    hosts.update(h for h in os.environ.get(ENV_HOSTS[provider], "").replace(",", " ").split())
+    extra = (_keys_file().get("key_hosts") or {})
+    extra = extra.get(provider) if isinstance(extra, dict) else None
+    if isinstance(extra, str):
+        extra = [extra]
+    if isinstance(extra, list):
+        hosts.update(str(h) for h in extra)
+    return {h.strip().rstrip(".").lower() for h in hosts if str(h).strip()}
+
+
+def key_allowed(provider, url):
+    """True when the key may be sent to url: an allowed host, over https unless it is this machine."""
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+    except ValueError:
+        return False
+    host = _host(url)
+    return host in key_hosts(provider) and (scheme == "https" or host in LOOPBACK)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib copies headers to the redirected request, the key among them.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} not followed", headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
 
 
 def post_json(url, headers, body, timeout):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"Content-Type": "application/json", **headers})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:500]
@@ -229,7 +285,7 @@ def post_json(url, headers, body, timeout):
             detail = err.get("message", detail) if isinstance(err, dict) else (err or detail)
         except (ValueError, AttributeError):
             pass
-        raise RuntimeError(f"{url} answered HTTP {e.code}: {detail}") from None
+        raise RuntimeError(f"{url} answered HTTP {e.code}: {detail or e.reason}") from None
     except urllib.error.URLError as e:
         raise RuntimeError(f"could not reach {url}: {e.reason}") from None
     except TimeoutError:
@@ -251,6 +307,13 @@ def ask(provider, model, base_url, system, user, temperature, max_tokens, seed, 
     base = (base_url.strip() or default_url).rstrip("/")
     model = model.strip() or default_model
     key = api_key(provider)
+    if key and not key_allowed(provider, base):
+        if provider != "openai_compatible":
+            raise RuntimeError(
+                f"Refusing to send your {provider} API key to {base}: only {DEFAULTS[provider][0]} is "
+                f"trusted. To use another host, add it to {ENV_HOSTS[provider]} or to \"key_hosts\" in "
+                f"keys.json (https only).")
+        key = ""  # a local server needs no key; one elsewhere must be listed to get it
     if provider == "anthropic":
         if not key:
             raise RuntimeError("No Anthropic API key: set ANTHROPIC_API_KEY or put it in keys.json.")
@@ -265,7 +328,14 @@ def ask(provider, model, base_url, system, user, temperature, max_tokens, seed, 
             "temperature": temperature, "max_tokens": max_tokens, "seed": seed % (2 ** 31)}
     if model:
         body["model"] = model
-    data = post_json(base + "/chat/completions", {"Authorization": f"Bearer {key}"} if key else {}, body, timeout)
+    try:
+        data = post_json(base + "/chat/completions", {"Authorization": f"Bearer {key}"} if key else {},
+                         body, timeout)
+    except RuntimeError as e:
+        if api_key(provider) and not key and any(f"HTTP {c}" in str(e) for c in (401, 403)):
+            raise RuntimeError(f"{e}\nYour {ENV_KEYS[provider]} was not sent, because {_host(base)} is not "
+                               f"listed in {ENV_HOSTS[provider]} or \"key_hosts\" in keys.json.") from None
+        raise
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"no answer in the reply: {str(data)[:300]}")
