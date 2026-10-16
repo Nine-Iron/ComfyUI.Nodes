@@ -30,6 +30,10 @@
 // Library shows. -previews N keeps extras as <name>.preview-2.<ext>, ... to
 // choose from: rename the one you want to <name>.preview.<ext>. Files you
 // already have get previews too, unless one is already there.
+// Beside each preview goes <name>.preview.json (or .preview-N.json) with what
+// Civitai records about how that picture was made (prompt, sampler, seed...),
+// which the Model Preview Popup shows. -preview-info fills these in for
+// previews saved before, by matching them to Civitai's images byte for byte.
 //
 // Checksums: only of what it downloads (to verify it), with -checksum, and with
 // -local. The tool keeps a state file in the models folder
@@ -51,6 +55,7 @@
 //	civitai-likes -rename-only -local   also files that are not liked models, looked up by checksum
 //	civitai-likes -rename-only -local -guess   and tag the ones Civitai does not know from their metadata
 //	civitai-likes -previews 4        keep up to 4 preview images per model to choose from
+//	civitai-likes -previews-only -preview-info   save generation settings for previews already on disk
 //	civitai-likes -checksum          checksum model files with none on record (slow, once per file)
 //	civitai-likes -latest            also fetch the newest version when you hold an older one
 //
@@ -79,6 +84,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -149,6 +155,9 @@ type apiModel struct {
 	Type          string       `json:"type"`
 	Mode          string       `json:"mode"`
 	ModelVersions []apiVersion `json:"modelVersions"`
+	Creator       struct {
+		Username string `json:"username"`
+	} `json:"creator"`
 }
 
 type apiPage struct {
@@ -187,6 +196,7 @@ type client struct {
 	base  *url.URL
 	token string
 	http  *http.Client
+	metas map[int64]map[string]json.RawMessage // version id -> image key -> generation data
 }
 
 func (c *client) do(ctx context.Context, rawURL string, hdr map[string]string) (*http.Response, error) {
@@ -658,10 +668,18 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 // --------------------------------------------------------------- previews
 
 type apiImage struct {
-	URL       string `json:"url"`
-	Type      string `json:"type"`
-	NSFW      any    `json:"nsfw"`
-	NSFWLevel any    `json:"nsfwLevel"`
+	URL       string          `json:"url"`
+	Type      string          `json:"type"`
+	NSFW      any             `json:"nsfw"`
+	NSFWLevel any             `json:"nsfwLevel"`
+	Meta      json.RawMessage `json:"meta"` // how the picture was made, when Civitai knows
+	ver       int64           // the version it was listed under
+}
+
+// hasMeta reports whether Civitai sent generation data with the image.
+func (im apiImage) hasMeta() bool {
+	m := strings.TrimSpace(string(im.Meta))
+	return m != "" && m != "null" && m != "{}"
 }
 
 func (im apiImage) still() bool {
@@ -695,6 +713,7 @@ func previewImages(first apiVersion, group []candidate) []apiImage {
 		for _, im := range v.Images {
 			if im.still() && !seen[im.URL] {
 				seen[im.URL] = true
+				im.ver = v.ID
 				out = append(out, im)
 			}
 		}
@@ -751,7 +770,7 @@ func sidecars(modelPath string) []string {
 		}
 		suffix := strings.TrimPrefix(name, base+".")
 		ok := suffix == "civitai.info" || suffix == "json" || suffix == "txt"
-		for _, x := range imageExts {
+		for _, x := range append(imageExts, "json") { // pictures and their generation settings
 			if suffix == x || suffix == "preview."+x {
 				ok = true
 			}
@@ -776,47 +795,56 @@ const maxPreviewBytes = 50 << 20
 // fetchImage saves one preview at stem.<ext>, the extension taken from what
 // the server says it sent. It never overwrites.
 func (c *client) fetchImage(ctx context.Context, rawURL, stem string) (string, error) {
+	data, ext, err := c.imageBytes(ctx, rawURL)
+	if err != nil {
+		return "", err
+	}
+	dest := stem + "." + ext
+	if _, err := os.Lstat(dest); err == nil {
+		return dest, nil
+	}
+	tmp := dest + ".part"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return "", err
+	}
+	return dest, os.Rename(tmp, dest)
+}
+
+// imageBytes downloads one image and says which extension it should have.
+func (c *client) imageBytes(ctx context.Context, rawURL string) ([]byte, string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
-		return "", fmt.Errorf("unusable image link %q", rawURL)
+		return nil, "", fmt.Errorf("unusable image link %q", rawURL)
 	}
 	var last error
 	for attempt := 1; attempt <= 3; attempt++ {
-		path, err := func() (string, error) {
+		data, ext, err := func() ([]byte, string, error) {
 			rctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 			defer cancel()
 			resp, err := c.do(rctx, rawURL, map[string]string{"Accept": "image/*"})
 			if err != nil {
-				return "", err
+				return nil, "", err
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				return "", statusError(resp)
+				return nil, "", statusError(resp)
 			}
 			ct := strings.ToLower(strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]))
 			ext, ok := imageTypes[ct]
 			if !ok {
-				return "", &httpError{status: http.StatusUnsupportedMediaType}
+				return nil, "", &httpError{status: http.StatusUnsupportedMediaType}
 			}
 			data, err := io.ReadAll(io.LimitReader(resp.Body, maxPreviewBytes+1))
 			if err != nil {
-				return "", err
+				return nil, "", err
 			}
 			if len(data) > maxPreviewBytes {
-				return "", fmt.Errorf("image larger than %s", human(maxPreviewBytes))
+				return nil, "", fmt.Errorf("image larger than %s", human(maxPreviewBytes))
 			}
-			dest := stem + "." + ext
-			if _, err := os.Lstat(dest); err == nil {
-				return dest, nil
-			}
-			tmp := dest + ".part"
-			if err := os.WriteFile(tmp, data, 0o644); err != nil {
-				return "", err
-			}
-			return dest, os.Rename(tmp, dest)
+			return data, ext, nil
 		}()
 		if err == nil {
-			return path, nil
+			return data, ext, nil
 		}
 		last = err
 		var he *httpError
@@ -825,15 +853,131 @@ func (c *client) fetchImage(ctx context.Context, rawURL, stem string) (string, e
 		}
 		if attempt < 3 {
 			if err := sleepCtx(ctx, backoff(attempt, err)); err != nil {
-				return "", err
+				return nil, "", err
 			}
 		}
 	}
 	var he *httpError
 	if errors.As(last, &he) && he.status == http.StatusUnsupportedMediaType {
-		return "", errors.New("not an image")
+		return nil, "", errors.New("not an image")
 	}
-	return "", last
+	return nil, "", last
+}
+
+// ------------------------------------------------- preview generation settings
+
+// infoPath is where the generation settings of a preview picture go:
+// x.preview.jpg -> x.preview.json, x.preview-2.png -> x.preview-2.json.
+func infoPath(picture string) string {
+	return strings.TrimSuffix(picture, filepath.Ext(picture)) + ".json"
+}
+
+// previewPictures lists the preview pictures beside a model that can carry a
+// settings file: <name>.preview.<ext> and <name>.preview-N.<ext>. (A plain
+// <name>.<ext> cannot: <name>.json is the model's own info file.)
+func previewPictures(modelPath string) []string {
+	var out []string
+	base := strings.TrimSuffix(modelPath, filepath.Ext(modelPath))
+	for _, sc := range sidecars(modelPath) {
+		suffix := strings.TrimPrefix(sc, base+".")
+		ext := strings.TrimPrefix(filepath.Ext(suffix), ".")
+		if strings.HasPrefix(suffix, "preview") && slices.Contains(imageExts, strings.ToLower(ext)) {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+var uuidPart = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// imageKey names a Civitai image independently of the size and format asked
+// for in its link: the id segment of image.civitai.com/<account>/<id>/<options>/<name>.
+func imageKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for _, p := range parts {
+		if uuidPart.MatchString(p) {
+			return strings.ToLower(p)
+		}
+	}
+	return strings.ToLower(strings.TrimSuffix(parts[len(parts)-1], filepath.Ext(parts[len(parts)-1])))
+}
+
+// imageMeta returns the generation data of an image: what came with the model
+// listing, or else what Civitai's image gallery has for it (looked up once per
+// version, the creator's own posts first).
+func (c *client) imageMeta(ctx context.Context, im apiImage, creator string) json.RawMessage {
+	if im.hasMeta() {
+		return im.Meta
+	}
+	if im.ver == 0 {
+		return nil
+	}
+	if c.metas == nil {
+		c.metas = map[int64]map[string]json.RawMessage{}
+	}
+	found, ok := c.metas[im.ver]
+	if !ok {
+		found = map[string]json.RawMessage{}
+		users := []string{creator}
+		if creator == "" {
+			users = []string{""}
+		}
+		for _, user := range users {
+			q := url.Values{"modelVersionId": {strconv.FormatInt(im.ver, 10)}, "limit": {"200"}}
+			if user != "" {
+				q.Set("username", user)
+			}
+			for page := 0; page < 3; page++ {
+				var resp struct {
+					Items    []apiImage `json:"items"`
+					Metadata struct {
+						NextCursor json.RawMessage `json:"nextCursor"`
+					} `json:"metadata"`
+				}
+				if err := c.getJSON(ctx, c.base.String()+"/api/v1/images?"+q.Encode(), &resp); err != nil {
+					break
+				}
+				for _, it := range resp.Items {
+					if it.hasMeta() {
+						found[imageKey(it.URL)] = it.Meta
+					}
+				}
+				cursor := strings.Trim(strings.TrimSpace(string(resp.Metadata.NextCursor)), `"`)
+				if cursor == "" || cursor == "null" || len(resp.Items) == 0 {
+					break
+				}
+				q.Set("cursor", cursor)
+			}
+		}
+		c.metas[im.ver] = found
+	}
+	return found[imageKey(im.URL)]
+}
+
+// writeImageInfo saves the generation data of a preview beside it. It never
+// overwrites a settings file that is there already.
+func writeImageInfo(picture, imageURL string, meta json.RawMessage) error {
+	dest := infoPath(picture)
+	if _, err := os.Lstat(dest); err == nil {
+		return nil
+	}
+	data, err := json.MarshalIndent(struct {
+		Source string          `json:"source"`
+		URL    string          `json:"url"`
+		Meta   json.RawMessage `json:"meta"`
+	}{"civitai", imageURL, meta}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := dest + ".part"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dest)
 }
 
 // -------------------------------------------------------------- base models
@@ -1153,6 +1297,7 @@ type thumbJob struct {
 	url  string
 	stem string // path without extension
 	slot int
+	img  apiImage
 }
 
 type item struct {
@@ -1168,6 +1313,7 @@ type item struct {
 	images    []apiImage  // preview candidates, best first
 	thumbs    []thumbJob  // previews to fetch
 	sidecars  [][2]string // files that move along with a rename
+	noInfo    []string    // preview pictures on disk with no settings file (-preview-info)
 	ea        bool        // Civitai has this version in early access right now
 	eaBlocked bool        // a download of it was refused before (recorded in the state file)
 	local     bool        // not a liked model: found on Civitai by its checksum (-local)
@@ -1556,7 +1702,8 @@ func settle(res *planResult, st *stateFile, idx *index, opt planOptions, from in
 				if next >= len(it.images) {
 					break
 				}
-				it.thumbs = append(it.thumbs, thumbJob{url: it.images[next].URL, stem: previewStem(final, slot), slot: slot})
+				it.thumbs = append(it.thumbs, thumbJob{url: it.images[next].URL, stem: previewStem(final, slot), slot: slot,
+					img: it.images[next]})
 				used[it.images[next].URL] = true
 				next++
 			}
@@ -2275,6 +2422,9 @@ func run() int {
 		"(their previews and info files go with them); no downloads, no previews")
 	previewsOnly := flag.Bool("previews-only", false, "only fetch missing previews for liked models you already have, up to\n"+
 		"-previews per file; no model downloads or renames")
+	previewInfo := flag.Bool("preview-info", false, "also save the generation settings (prompt, sampler, seed...) of preview pictures\n"+
+		"already on disk that have none, matching each to Civitai's images byte for byte\n"+
+		"(those images are downloaded again to compare). New previews always get them")
 	eaRetry := flag.Bool("ea", false, "retry early access versions Civitai refused before, without waiting for their\n"+
 		"early access to end (for ones you have since paid for); on its own, only those")
 	eaAll := flag.Bool("all", false, "with -ea: also do everything a normal run does")
@@ -2341,7 +2491,7 @@ func run() int {
 		*rename = false
 	}
 	if *previewsOnly {
-		if *previews == 0 {
+		if *previews == 0 && !*previewInfo {
 			fmt.Fprintln(os.Stderr, "-previews-only with -previews 0 has nothing to do")
 			return 2
 		}
@@ -2513,6 +2663,24 @@ func run() int {
 	for _, it := range items {
 		if it.status == stHave && it.rename != "" {
 			untagged++
+		}
+	}
+	infoPics, infoFiles := 0, 0
+	if *previewInfo && !eaOnly {
+		for i := range items {
+			it := &items[i]
+			if it.status != stHave || len(it.images) == 0 {
+				continue
+			}
+			for _, pic := range previewPictures(it.found) {
+				if _, err := os.Lstat(infoPath(pic)); err != nil {
+					it.noInfo = append(it.noInfo, pic)
+				}
+			}
+			if len(it.noInfo) > 0 {
+				infoPics += len(it.noInfo)
+				infoFiles++
+			}
 		}
 	}
 	if *renameOnly {
@@ -2726,6 +2894,12 @@ func run() int {
 	if noImages > 0 {
 		fmt.Printf("\n%d model file(s) have no preview and Civitai offers no still image for them.\n", noImages)
 	}
+	if infoPics > 0 {
+		fmt.Printf("\nGeneration settings to look up for previews you have: %d picture(s) of %d model file(s).\n", infoPics, infoFiles)
+		fmt.Println("  Civitai's images for them are downloaded again to tell which picture is which.")
+	} else if *previewInfo && !eaOnly {
+		fmt.Println("\nEvery preview picture of a liked model you have already has its generation settings file.")
+	}
 
 	var need int64
 	for _, it := range items {
@@ -2751,7 +2925,7 @@ func run() int {
 		}
 		return line
 	})
-	if count == 0 && renames == 0 && thumbsHave == 0 {
+	if count == 0 && renames == 0 && thumbsHave == 0 && infoPics == 0 {
 		if *renameOnly {
 			fmt.Printf("\nEvery model file it knows the base of is already named for -tag %s.\n", tagMode)
 			return 0
@@ -2790,6 +2964,9 @@ func run() int {
 		if t := thumbsHave + thumbsNew; t > 0 {
 			parts = append(parts, fmt.Sprintf("fetch %d preview(s)", t))
 		}
+		if infoPics > 0 {
+			parts = append(parts, fmt.Sprintf("look up settings for %d preview(s)", infoPics))
+		}
 		question := strings.Join(parts, ", ")
 		fmt.Printf("%s%s? [y/N] ", strings.ToUpper(question[:1]), question[1:])
 		answer, rerr := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -2804,6 +2981,7 @@ func run() int {
 	}
 
 	var failed []string
+	infos := 0 // settings files written
 	fetchThumbs := func(it item) int {
 		saved := 0
 		rel := idx.rel(it.final(*rename))
@@ -2817,12 +2995,41 @@ func run() int {
 			}
 			saved++
 			fmt.Printf("    preview %d  ->  %s\n", tj.slot, idx.rel(path))
+			if meta := c.imageMeta(ctx, tj.img, it.model.Creator.Username); meta != nil {
+				if err := writeImageInfo(path, tj.url, meta); err != nil {
+					failed = append(failed, fmt.Sprintf("settings for preview %d of %s: %v", tj.slot, label(it), err))
+				} else {
+					infos++
+				}
+			}
 			if e := st.Files[rel]; e != nil {
 				e.Previews = append(e.Previews, tj.url)
 			}
 		}
 		st.saveOrWarn()
 		return saved
+	}
+
+	infoMatched, infoMissing := 0, 0
+	if infoPics > 0 {
+		fmt.Println("\nGeneration settings for previews you have:")
+		for i := range items {
+			it := &items[i]
+			if len(it.noInfo) == 0 {
+				continue
+			}
+			m, miss, err := fillPreviewInfo(ctx, c, st, idx, it)
+			if ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "\nInterrupted. Settings files saved so far are kept.")
+				return 130
+			}
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("settings for %s: %v", label(*it), err))
+			}
+			infoMatched += m
+			infoMissing += miss
+		}
+		infos += infoMatched
 	}
 
 	if renames > 0 {
@@ -2849,9 +3056,6 @@ func run() int {
 				st.Files[idx.rel(to)] = e
 			}
 			fmt.Printf("renamed %s  ->  %s\n", idx.rel(it.found), idx.rel(to))
-			if old := filepath.Dir(it.found); isTagDir(old) && !strings.EqualFold(old, filepath.Dir(to)) {
-				os.Remove(old) // a tag folder left empty; fails harmlessly if anything is still in it
-			}
 			for _, sc := range it.sidecars {
 				if _, err := os.Lstat(sc[1]); err == nil {
 					continue
@@ -2859,6 +3063,10 @@ func run() int {
 				if err := os.Rename(sc[0], sc[1]); err != nil {
 					failed = append(failed, fmt.Sprintf("rename %s: %v", idx.rel(sc[0]), err))
 				}
+			}
+			// After the previews have moved out too: a tag folder left empty goes.
+			if old := filepath.Dir(it.found); isTagDir(old) && !strings.EqualFold(old, filepath.Dir(to)) {
+				os.Remove(old) // fails harmlessly if anything is still in it
 			}
 		}
 		st.saveOrWarn()
@@ -2927,13 +3135,23 @@ func run() int {
 		got += fetchThumbs(it)
 	}
 	st.saveOrWarn()
+	var summary []string
 	if count > 0 {
-		fmt.Printf("\nDownloaded %d of %d model(s).", ok, count)
+		summary = append(summary, fmt.Sprintf("Downloaded %d of %d model(s).", ok, count))
 	}
 	if thumbsHave+thumbsNew > 0 {
-		fmt.Printf(" Previews saved: %d.", got)
+		summary = append(summary, fmt.Sprintf("Previews saved: %d.", got))
 	}
-	fmt.Println()
+	if infos > 0 || infoPics > 0 {
+		summary = append(summary, fmt.Sprintf("Generation settings saved: %d.", infos))
+	}
+	if len(summary) > 0 {
+		fmt.Println("\n" + strings.Join(summary, " "))
+	}
+	if infoMissing > 0 {
+		fmt.Printf("%d preview picture(s) got no settings: not among Civitai's images for the model (your own\n"+
+			"pictures, or changed since), or Civitai keeps no settings for them.\n", infoMissing)
+	}
 	if eaNoted > 0 {
 		fmt.Printf("Refused by Civitai: %d, noted in the state file and held back (until early access ends, if Civitai gives a date; -ea retries).\n", eaNoted)
 	}
@@ -2945,6 +3163,89 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// fillPreviewInfo saves settings files for the preview pictures of one model
+// file that have none. Which Civitai image a picture is cannot be told from its
+// name, so candidates are downloaded and compared byte for byte: the images
+// recorded as saved for this file first, then the rest Civitai lists.
+func fillPreviewInfo(ctx context.Context, c *client, st *stateFile, idx *index, it *item) (matched, missing int, err error) {
+	const maxTries = 16
+	want := map[string]string{} // sha256 -> picture still waiting for its settings
+	for _, pic := range it.noInfo {
+		sum, err := hashFile(ctx, pic)
+		if err != nil {
+			if ctx.Err() != nil {
+				return matched, missing, ctx.Err()
+			}
+			missing++
+			continue
+		}
+		want[sum] = pic
+	}
+	var order []apiImage
+	seen := map[string]bool{}
+	if e := st.Files[idx.rel(it.found)]; e != nil {
+		for _, u := range e.Previews {
+			for _, im := range it.images {
+				if im.URL == u && !seen[u] {
+					seen[u] = true
+					order = append(order, im)
+				}
+			}
+		}
+	}
+	for _, im := range it.images {
+		if !seen[im.URL] {
+			seen[im.URL] = true
+			order = append(order, im)
+		}
+	}
+	tries := 0
+	var lastErr error
+	for _, im := range order {
+		if len(want) == 0 || tries >= maxTries {
+			break
+		}
+		tries++
+		data, _, err := c.imageBytes(ctx, im.URL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return matched, missing, ctx.Err()
+			}
+			lastErr = err
+			continue
+		}
+		h := sha256.Sum256(data)
+		pic, ok := want[hex.EncodeToString(h[:])]
+		if !ok {
+			continue
+		}
+		delete(want, hex.EncodeToString(h[:]))
+		meta := c.imageMeta(ctx, im, it.model.Creator.Username)
+		if meta == nil {
+			missing++
+			continue
+		}
+		if err := writeImageInfo(pic, im.URL, meta); err != nil {
+			return matched, missing, err
+		}
+		matched++
+		fmt.Printf("    %s\n", idx.rel(infoPath(pic)))
+		if it.rename != "" { // the settings file follows its picture when the model is renamed
+			oldBase := strings.TrimSuffix(it.found, filepath.Ext(it.found))
+			newBase := strings.TrimSuffix(it.rename, filepath.Ext(it.rename))
+			src := infoPath(pic)
+			if dst := newBase + strings.TrimPrefix(src, oldBase); dst != src {
+				it.sidecars = append(it.sidecars, [2]string{src, dst})
+			}
+		}
+	}
+	missing += len(want)
+	if matched == 0 && lastErr != nil {
+		return matched, missing, lastErr
+	}
+	return matched, missing, nil
 }
 
 func main() { os.Exit(run()) }

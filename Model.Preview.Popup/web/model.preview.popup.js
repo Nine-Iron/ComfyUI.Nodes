@@ -6,7 +6,10 @@
 //    pictures still loading for the last one.
 // 2. When a model has preview files, the thumbnail embedded in the model file
 //    is dropped from its metadata, so the sidebar icon keeps showing yours.
-// 3. The popup shows the model's base model in large type, and its "Base
+// 3. Beside the picture, a column shows what that picture was made with
+//    (prompt, negative, sampler settings, LoRAs) when it is known: from the
+//    .preview.json civitai-likes saves, or from metadata inside the image.
+// 4. The popup shows the model's base model in large type, and its "Base
 //    models" button picks which base models are listed in the Model Library and
 //    in loader dropdowns. The choice is saved in ComfyUI's user settings.
 
@@ -32,6 +35,28 @@ const STYLE = `
 .mpp-btn:hover { border-color: var(--p-primary-color, #3b82f6); }
 .mpp-title { font-weight: 600; font-size: 13px; margin-bottom: 2px; overflow-wrap: anywhere; }
 .mpp-file { color: var(--descrip-text, #999); font-size: 11px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.mpp-popup.has-info { width: 720px; }
+.mpp-body { display: flex; gap: 10px; align-items: flex-start; }
+.mpp-body > .mpp-stage { flex: 0 0 378px; max-width: 100%; }
+.mpp-info { flex: 1 1 0; min-width: 0; max-height: max(var(--mpp-max, 52vh), 160px); overflow-y: auto;
+  padding-right: 2px; display: none; }
+.mpp-popup.has-info .mpp-info { display: block; }
+@media (max-width: 760px) { .mpp-body { flex-wrap: wrap; } .mpp-body > .mpp-stage { flex-basis: 100%; }
+  .mpp-info { flex-basis: 100%; max-height: 30vh; } }
+.mpp-ihead { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.mpp-ihead b { flex: 1; font-size: 13px; }
+.mpp-src { font-size: 10px; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border-color, #555);
+  color: var(--descrip-text, #aaa); }
+.mpp-none { color: var(--descrip-text, #888); font-style: italic; padding: 6px 0; }
+.mpp-sec { margin-bottom: 8px; }
+.mpp-lab { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 2px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--descrip-text, #999); }
+.mpp-lab .mpp-btn { padding: 0 6px; font-size: 10px; text-transform: none; letter-spacing: 0; }
+.mpp-text { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; padding: 5px 7px; border-radius: 4px;
+  background: var(--comfy-input-bg, #111); max-height: 14em; overflow-y: auto; }
+.mpp-grid { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; user-select: text; }
+.mpp-grid dt { color: var(--descrip-text, #999); white-space: nowrap; }
+.mpp-grid dd { margin: 0; overflow-wrap: anywhere; color: var(--fg-color, #ddd); }
 .mpp-stage { position: relative; width: 100%; min-height: 80px; border-radius: 4px;
   background: var(--comfy-input-bg, #111); overflow: hidden; }
 .mpp-main { display: block; width: 100%; height: auto; max-height: var(--mpp-max, 52vh); object-fit: contain; }
@@ -77,8 +102,9 @@ function previewsFor(folder, filename) {
   const promise = api.fetchApi(`/Model.Preview.Popup/list?${q}`)
     .then((r) => (r.ok ? r.json() : {}))
     .then((d) => ({ images: Array.isArray(d.images) ? d.images : [], base: d.base || "unknown",
+                    info: d.info && typeof d.info === "object" ? d.info : {},
                     baseLabel: d.baseLabel || "Unknown", baseSource: d.baseSource || "none" }))
-    .catch(() => { listCache.delete(key); return { images: [], base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
+    .catch(() => { listCache.delete(key); return { images: [], info: {}, base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
   listCache.set(key, { at: Date.now(), promise });
   return promise;
 }
@@ -273,7 +299,7 @@ async function openBaseDialog() {
 }
 
 // --- the popup ---------------------------------------------------------------
-let popup, baseEl, titleEl, fileEl, stage, mainImg, loadingEl, extrasEl, metaEl;
+let popup, baseEl, titleEl, fileEl, bodyEl, stage, mainImg, loadingEl, extrasEl, infoEl, metaEl;
 let hideTimer = null;
 let currentKey = null;
 let anchor = null;
@@ -297,8 +323,11 @@ function build() {
   mainImg = Object.assign(document.createElement("img"), { className: "mpp-main", alt: "" });
   loadingEl = Object.assign(document.createElement("div"), { className: "mpp-loading", textContent: "loading…" });
   stage.append(mainImg, loadingEl);
+  infoEl = Object.assign(document.createElement("div"), { className: "mpp-info" });
+  bodyEl = Object.assign(document.createElement("div"), { className: "mpp-body" });
+  bodyEl.append(stage, infoEl);
   metaEl = Object.assign(document.createElement("div"), { className: "mpp-meta" });
-  popup.append(head, titleEl, fileEl, extrasEl, stage, metaEl);
+  popup.append(head, titleEl, fileEl, extrasEl, bodyEl, metaEl);
   popup.addEventListener("mouseenter", () => clearTimeout(hideTimer));
   popup.addEventListener("mouseleave", scheduleHide);
   document.body.appendChild(popup);
@@ -313,7 +342,10 @@ function place() {
   if (!anchor || popup.style.display === "none") return;
   const row = anchor.getBoundingClientRect();
   const panel = (anchor.closest(".p-tree, [class*=sidebar], .side-bar-panel") || anchor.parentElement).getBoundingClientRect();
-  const chrome = popup.offsetHeight - stage.offsetHeight; // everything but the picture
+  // Everything but the picture (and the settings column when it sits beside it;
+  // in a narrow window it wraps below and counts as chrome).
+  const stacked = infoEl.offsetParent && infoEl.offsetTop > stage.offsetTop + 1;
+  const chrome = popup.offsetHeight - (stacked ? stage.offsetHeight : bodyEl.offsetHeight);
   const w = popup.offsetWidth;
   const h = chrome + MAX_IMAGE();
   let left = panel.right + 8;
@@ -336,6 +368,81 @@ function hide() {
 function scheduleHide() {
   clearTimeout(hideTimer);
   hideTimer = setTimeout(hide, HIDE_DELAY);
+}
+
+// --- generation settings column ---------------------------------------------
+const SOURCES = { civitai: "Civitai", comfyui: "ComfyUI", a1111: "A1111 / Forge" };
+
+async function copyText(value, btn) {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch { // plain http on a LAN address has no clipboard API
+    const ta = Object.assign(document.createElement("textarea"), { value });
+    ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+  const was = btn.textContent;
+  btn.textContent = "Copied";
+  setTimeout(() => (btn.textContent = was), 1000);
+}
+
+function el(tag, className, textContent) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (textContent !== undefined) e.textContent = textContent;
+  return e;
+}
+
+// The settings as one A1111-style "parameters" block, for pasting elsewhere.
+function asParameters(info) {
+  let out = info.prompt || "";
+  if (info.negative) out += `\nNegative prompt: ${info.negative}`;
+  const s = info.settings.map(([k, v]) => `${k}: ${/[,:\n]/.test(v) ? JSON.stringify(v) : v}`);
+  if (info.loras.length) s.push(`LoRAs: ${JSON.stringify(info.loras.map(([n, w]) => `${n}:${w}`).join(", "))}`);
+  if (s.length) out += `\n${s.join(", ")}`;
+  return out.trim();
+}
+
+function renderInfo(info) {
+  infoEl.replaceChildren();
+  infoEl.scrollTop = 0;
+  const head = el("div", "mpp-ihead");
+  head.append(el("b", "", "Generation"));
+  if (!info) {
+    infoEl.append(head, el("div", "mpp-none", "No settings saved with this picture."));
+    return;
+  }
+  info = { prompt: "", negative: "", settings: [], loras: [], ...info };
+  if (SOURCES[info.source]) head.append(el("span", "mpp-src", SOURCES[info.source]));
+  const all = el("button", "mpp-btn", "Copy all");
+  all.title = "Copy prompt and settings as one A1111-style block";
+  all.addEventListener("click", () => copyText(asParameters(info), all));
+  head.append(all);
+  infoEl.append(head);
+  for (const [label, value] of [["Prompt", info.prompt], ["Negative", info.negative]]) {
+    if (!value) continue;
+    const sec = el("div", "mpp-sec");
+    const lab = el("div", "mpp-lab");
+    const btn = el("button", "mpp-btn", "Copy");
+    btn.addEventListener("click", () => copyText(value, btn));
+    lab.append(el("span", "", label), btn);
+    sec.append(lab, el("div", "mpp-text", value));
+    infoEl.append(sec);
+  }
+  const rows = [...info.settings];
+  for (const [name, w] of info.loras) rows.push([`LoRA ${w}`, name]);
+  if (rows.length) {
+    const sec = el("div", "mpp-sec");
+    sec.append(el("div", "mpp-lab", "Settings"));
+    const dl = el("dl", "mpp-grid");
+    dl.style.margin = "0";
+    for (const [k, v] of rows) dl.append(el("dt", "", k), el("dd", "", String(v)));
+    sec.append(dl);
+    infoEl.append(sec);
+  }
 }
 
 function text(meta, ...keys) {
@@ -379,8 +486,12 @@ async function show(leaf, folder, filename) {
     slot.title = name;
     return slot;
   });
+  const hasInfo = images.some((n) => info.info[n]);
+  popup.classList.toggle("has-info", hasInfo);
+  if (hasInfo) renderInfo(info.info[images[0]]); // before the first picture arrives
   const select = (i) => {
     current = i;
+    if (hasInfo) renderInfo(info.info[images[i]]);
     if (urls[i]) { mainImg.src = urls[i]; loadingEl.style.display = "none"; stage.classList.remove("is-loading"); }
     else { mainImg.removeAttribute("src"); loadingEl.style.display = ""; stage.classList.add("is-loading"); }
     extrasEl.querySelectorAll("img").forEach((el) => el.classList.toggle("is-current", Number(el.dataset.i) === i));

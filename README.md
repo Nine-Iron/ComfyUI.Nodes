@@ -6,10 +6,10 @@ Four small tools for working with models and prompts in [ComfyUI](https://github
 | --- | --- | --- |
 | [`Lora.Tag.Picker/`](#lora-tag-picker) | Custom node | Reads the training tags out of the LoRAs you have loaded and adds the ones you pick to your prompt. |
 | [`Prompt.Generator/`](#prompt-generator) | Custom nodes | Makes random prompts, from wildcard templates or by asking a language model (Claude, ChatGPT, or a local server). |
-| [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, and lets you hide base models you don't use. |
+| [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, with the prompt and settings each preview was made with, and lets you hide base models you don't use. |
 | [`CivitAI.Model.Plus.Preview.Picker/`](#civitai-likes) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
 
-Each one works on its own, and they work well together: civitai-likes saves previews and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
+Each one works on its own, and they work well together: civitai-likes saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
 
 ## Contents
 
@@ -187,6 +187,19 @@ Two things to know:
 
 New preview files are picked up within about 30 seconds, without a restart.
 
+### Generation settings
+
+When the settings a picture was made with are known, a column beside it shows them: prompt, negative prompt, model, sampler, scheduler, steps, CFG, seed, size, and LoRAs with their weights. It follows the picture you are looking at. **Copy** copies the prompt or negative prompt; **Copy all** copies everything as one A1111-style block. Models with no settings for any of their pictures keep the narrow popup.
+
+The settings come from, first match wins:
+
+| Source | Where it comes from |
+| --- | --- |
+| `<name>.preview.json`, `<name>.preview-N.json` | Saved by civitai-likes beside each preview it downloads: what Civitai records for that image. For previews downloaded before, run `civitai-likes -previews-only -preview-info` once. |
+| Metadata inside the picture | A1111 / Forge `parameters` (PNG text, or JPEG/WebP EXIF), or the ComfyUI prompt graph in a PNG or WebP saved by ComfyUI. Your own renders dropped beside a model show their settings this way. |
+
+A plain `<name>.<ext>` preview only uses metadata inside the picture, since `<name>.json` beside a model is the model's own info file. Civitai's resized images do not keep embedded metadata, which is why civitai-likes saves the settings separately.
+
 ### Base models
 
 The top of the popup names the model's base model (for example **Flux.1 D**). It is worked out in this order:
@@ -235,6 +248,7 @@ civitai-likes -base pony         # only Pony models
 civitai-likes -base sdxl1,sd1    # only these base models
 civitai-likes -previews 4        # keep up to 4 preview images per model
 civitai-likes -previews-only     # only fetch missing previews for models you have
+civitai-likes -previews-only -preview-info   # also save generation settings for previews you already have
 civitai-likes -rename            # also rename files you already have to the tagged form
 civitai-likes -rename-only       # only rename, no downloads or previews
 civitai-likes -rename-only -local          # also rename files that are not liked models, looked up by checksum
@@ -255,6 +269,7 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | `-tag` | `front` | Where the base model tag goes in file names; see [File names](#file-names). |
 | `-previews` | `1` | Preview images to keep per model file (`0` for none) |
 | `-previews-only` | off | Only fetch missing previews for liked models already on disk |
+| `-preview-info` | off | Also save generation settings for preview pictures already on disk that have none; see [Previews](#what-it-does) |
 | `-rename` | off | Also rename files you already have to the tagged form |
 | `-rename-only` | off | Only rename; no downloads, no previews |
 | `-local` | off | Also look up model files that are not liked models on Civitai by checksum, so they get tagged and previewed too |
@@ -304,7 +319,7 @@ Files are saved with their base model tag in the name, so loader lists group by 
 | `folder` | `loras/flux1_dev/some_lora.safetensors` |
 | `none` | `loras/some_lora.safetensors` (Civitai's name, untouched) |
 
-Files saved under any of these forms are recognised, so you can change `-tag` later and run `-rename-only` to move existing files to the new form. Previews and info files beside a model (`.preview.*`, `.preview-N.*`, `.civitai.info`, `.json`, `.txt`) move with it. A file in one tag folder is moved to its own, never nested (`loras/sdxl1/x` for a Pony file becomes `loras/pony/x`). A `.gguf` diffusion model filed under `checkpoints` is moved to `diffusion_models`, where ComfyUI's GGUF loader looks for it.
+Files saved under any of these forms are recognised, so you can change `-tag` later and run `-rename-only` to move existing files to the new form. Previews, their settings files, and info files beside a model (`.preview.*`, `.preview-N.*`, `.civitai.info`, `.json`, `.txt`) move with it. A file in one tag folder is moved to its own, never nested (`loras/sdxl1/x` for a Pony file becomes `loras/pony/x`). A `.gguf` diffusion model filed under `checkpoints` is moved to `diffusion_models`, where ComfyUI's GGUF loader looks for it.
 
 Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `Flux.1 S` is `flux1_schnell`, `SDXL 1.0` is `sdxl1`, `SD 1.5` is `sd1`, `Krea 2` is `krea2`, `Pony V7` is `pony_v7`, and so on. Upscalers work with any base model and are never tagged.
 
@@ -313,7 +328,7 @@ Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `
 - **Versions.** A liked model with versions for several base models gets one file per selected base model, the newest version for each.
 - **Placement.** Each Civitai model type goes to its ComfyUI folder: checkpoints, `loras` (LORA, LoCon, DoRA), `embeddings`, `vae`, `controlnet`, `upscale_models`, `hypernetworks`, `animatediff_models`.
 - **Duplicate checks.** Before downloading, each file is checked against the whole models tree, whatever folder it was filed under and whichever `-tag` form it has: first by name for every version, then by size and SHA-256 to catch a copy saved under another name. Only what is missing is downloaded, and nothing is ever overwritten. Files that share a name and size but can't be told apart without checksums are left alone and listed, never guessed.
-- **Previews.** Each model file gets the first still image from its Civitai page saved beside it as `<name>.preview.<ext>`, safe-for-work images first. With `-previews N`, extras are saved as `<name>.preview-2.<ext>` and so on; rename the one you want to `<name>.preview.<ext>` to make it the icon. Files you already have get previews too, unless one is already there.
+- **Previews.** Each model file gets the first still image from its Civitai page saved beside it as `<name>.preview.<ext>`, safe-for-work images first. With `-previews N`, extras are saved as `<name>.preview-2.<ext>` and so on; rename the one you want to `<name>.preview.<ext>` to make it the icon (rename its `.json` with it, or the settings stay with the old name). Files you already have get previews too, unless one is already there. Beside each preview goes `<name>.preview.json` (`.preview-N.json` for extras) with what Civitai records about how that picture was made, which Model Preview Popup shows; when the model listing carries none, the version's image gallery is checked. Previews saved before this existed get theirs with `-preview-info`: which Civitai image a picture is cannot be told from its name, so up to 16 of the model's images are downloaded again and matched byte for byte. Pictures that match none (your own, say) are counted and left alone.
 - **Other model files.** With `-local`, model files no liked model accounts for (in `checkpoints`, `loras`, `diffusion_models`, `unet`, `embeddings`, `controlnet`, `hypernetworks`, `vae`, `animatediff_models`) are checksummed once and looked up on Civitai, so they get tagged and previewed like the rest. With `-guess`, files Civitai does not know, such as your own trainings, are tagged from the base model their metadata names. Whatever is left without a base model is listed with the reason.
 - **Checksums.** The state file records what has been seen. Downloads are always checksummed to verify them; a download that fails is kept aside as `<name>.unverified`, hidden from ComfyUI, and listed on every run. Other files are checksummed only with `-checksum` or `-local`, each once.
 - **Early access.** A version Civitai refuses to hand over (401, 402, or 403, typically early access you have not paid for) is recorded in the state file rather than reported as a failure. Later runs hold it back until its early access ends, or indefinitely if Civitai gives no end date, and list it under "Refused before, held back". Run with `-ea` once you have paid for it to try again right away; on its own, `-ea` retries only those versions, and `-ea -all` also does a full run. The plan marks versions that are currently in early access with their end date.
@@ -331,7 +346,7 @@ The ComfyUI pieces add these routes to the ComfyUI server, handy for scripts:
 | Route | Returns |
 | --- | --- |
 | `GET /Lora.Tag.Picker/tags?name=<lora name>` | A LoRA's ranked tags, image count, and notes, as JSON |
-| `GET /Model.Preview.Popup/list?folder=<folder>&filename=<file>` | A model's preview file names and base model |
+| `GET /Model.Preview.Popup/list?folder=<folder>&filename=<file>` | A model's preview file names, the generation settings of each picture that has them, and its base model |
 | `GET /Model.Preview.Popup/image?folder=<folder>&filename=<file>&name=<preview>` | One preview image (only files the list route returns) |
 | `GET /Model.Preview.Popup/bases` | The base model of every file in the filtered folders, plus labels |
 
