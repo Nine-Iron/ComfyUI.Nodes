@@ -1,4 +1,4 @@
-// civitai-likes downloads the models you have liked on Civitai into a ComfyUI
+// moFlo downloads the models you have liked on Civitai into a ComfyUI
 // models folder, without ever fetching one you already have.
 //
 // Files are saved with their base model in the name, where -tag says:
@@ -7,10 +7,8 @@
 // Files saved under any of these forms are recognised, so -tag can change
 // later (-rename-only moves existing files to the new form).
 //
-// Config: default flags can be kept in ~/.config/civitai-likes/config, one
-// "flag = value" per line (# comments). Flags on the command line win.
-// civitai-likes -print-config > ~/.config/civitai-likes/config writes a
-// starting file with every flag in it.
+// Config: ~/.config/moflo/config.json (see below). Flags on the command line
+// win for that run; -set-conf saves them as the new defaults.
 // A liked model with versions for several base models gets one file per
 // selected base model (the newest version for each).
 //
@@ -37,33 +35,36 @@
 //
 // Checksums: only of what it downloads (to verify it), with -checksum, and with
 // -local. The tool keeps a state file in the models folder
-// (.civitai-likes.json) with what it has seen; -checksum checksums every model
+// (.moflo.json) with what it has seen; -checksum checksums every model
 // file with none on record (each file once), and the recorded checksums are
 // used to spot copies saved under other names and to tell apart files that
 // share a name and size. Without them such cases are left alone, never guessed.
 //
 // Usage:
 //
-//	civitai-likes -n                 show what would happen, change nothing
-//	civitai-likes                    show the plan, ask, then download
-//	civitai-likes -yes               no question asked
-//	civitai-likes -base pony         only Pony models
-//	civitai-likes -base sdxl1,sd1    only these base models
-//	civitai-likes                    every base model (same as -base all)
-//	civitai-likes -rename            also rename files you already have to the tagged form
-//	civitai-likes -rename-only       only that: rename, no downloads or previews
-//	civitai-likes -rename-only -local   also files that are not liked models, looked up by checksum
-//	civitai-likes -rename-only -local -guess   and tag the ones Civitai does not know from their metadata
-//	civitai-likes -previews 4        keep up to 4 preview images per model to choose from
-//	civitai-likes -previews-only -preview-info   save generation settings for previews already on disk
-//	civitai-likes -checksum          checksum model files with none on record (slow, once per file)
-//	civitai-likes -latest            also fetch the newest version when you hold an older one
+//	moflo -n                 show what would happen, change nothing
+//	moflo                    show the plan, ask, then download
+//	moflo -yes               no question asked
+//	moflo -base pony         only Pony models, this run
+//	moflo -base sdxl1,sd1    only these base models, this run
+//	moflo -reconfig          pick again which base models are downloaded
+//	moflo -set-conf -previews 3   save flags as the defaults in the config file
+//	moflo -rename            also rename files you already have to the tagged form
+//	moflo -rename-only       only that: rename, no downloads or previews
+//	moflo -rename-only -local   also files that are not liked models, looked up by checksum
+//	moflo -rename-only -local -guess   and tag the ones Civitai does not know from their metadata
+//	moflo -previews 4        keep up to 4 preview images per model to choose from
+//	moflo -previews-only -preview-info   save generation settings for previews already on disk
+//	moflo -checksum          checksum model files with none on record (slow, once per file)
+//	moflo -latest            also fetch the newest version when you hold an older one
 //
-// -base picks the base models to handle (downloads, renames, previews); without
-// it every base is handled. A run with -base lists the other base models found
-// in your likes with the tag to pass, and says per selected base what it found.
+// The config file (~/.config/moflo/config.json) holds every flag's
+// default, which base models are downloaded (asked on the first run, and for
+// new ones), per-base previews and latest, and per base model the liked models
+// with what became of each; "download": false on one keeps it from being
+// downloaded for that base. -base picks the base models for one run instead.
 //
-// Build: go build -o civitai-likes civitai.likes.go   (standard library only)
+// Build: go build -o moflo moflo.go   (standard library only)
 package main
 
 import (
@@ -77,6 +78,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"mime"
 	"net/http"
@@ -94,7 +96,7 @@ import (
 )
 
 const (
-	userAgent     = "civitai-likes/1.0"
+	userAgent     = "moflo/1.0"
 	sizeSlack     = 1024             // bytes; the API reports sizes in KB
 	stallTimeout  = 2 * time.Minute  // abort a download that stops sending data
 	apiTimeout    = 60 * time.Second // per API request
@@ -1291,6 +1293,7 @@ const (
 	stSkip  = "skip"  // nothing to download
 	stGet   = "get"   // will be downloaded
 	stWait  = "wait"  // early access refused before; waiting for it to end
+	stOff   = "off"   // its base model is not downloaded (listed in the config only)
 )
 
 type thumbJob struct {
@@ -1344,6 +1347,18 @@ type planOptions struct {
 	rename   bool
 	previews int
 	unsure   map[string]bool // files that fit several liked files by name and size, with no checksum
+	// From the config file:
+	blocked      map[string]bool // modelKey -> "download": false for that base
+	basePreviews map[string]int  // base tag -> previews for it
+	baseLatest   map[string]bool // base tag -> latest for it
+}
+
+// previewsFor is how many previews a file of this base model keeps.
+func (o planOptions) previewsFor(tag string) int {
+	if n, ok := o.basePreviews[tag]; ok {
+		return n
+	}
+	return o.previews
 }
 
 type planResult struct {
@@ -1351,6 +1366,7 @@ type planResult struct {
 	others  map[string]int    // base tag not selected -> liked models that have it
 	names   map[string]string // base tag -> what Civitai calls it
 	matched map[string]bool   // selected tags that at least one liked model has
+	off     []item            // liked models of base models not handled (for the config's lists)
 }
 
 // modelFile picks the file of a version that is the model itself.
@@ -1403,7 +1419,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 		it := item{model: m, ver: target.ver, file: target.file, tag: target.tag}
 		it.images = previewImages(target.ver, cands)
 		check := cands
-		if opt.latest {
+		if opt.latest || opt.baseLatest[target.tag] {
 			check = cands[:1]
 		}
 		have := func(l localFile, cd candidate, how string, i int) item {
@@ -1549,18 +1565,24 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			res.items = append(res.items, item{model: m, status: stSkip, note: note})
 			continue
 		}
-		if agnostic && !opt.all {
-			continue // no base model (upscalers): only handled when every base is
+		if agnostic && !opt.all && !opt.bases[""] {
+			res.others[""]++ // no base model (upscalers), not selected
+			res.off = append(res.off, item{model: m, ver: groups[""][0].ver, status: stOff})
+			continue
 		}
 		for _, tag := range order {
-			if !agnostic {
-				if !opt.all && !opt.bases[tag] {
-					res.others[tag]++ // -base: not handled at all this run
-					continue
-				}
-				res.matched[tag] = true
+			if !agnostic && !opt.all && !opt.bases[tag] {
+				res.others[tag]++ // not handled at all this run
+				res.off = append(res.off, item{model: m, ver: groups[tag][0].ver, tag: tag, status: stOff})
+				continue
 			}
-			res.items = append(res.items, evaluate(m, dir, groups[tag]))
+			res.matched[tag] = true
+			it := evaluate(m, dir, groups[tag])
+			if it.status == stGet && opt.blocked[modelKey(tag, m.ID)] {
+				it.status, it.dest = stSkip, ""
+				it.note = "not downloaded: \"download\" is false for it in the config"
+			}
+			res.items = append(res.items, it)
 		}
 	}
 	settle(res, st, idx, opt, 0)
@@ -1674,12 +1696,13 @@ func settle(res *planResult, st *stateFile, idx *index, opt planOptions, from in
 
 	// Previews: for every file kept or downloaded, fill the preview slots that
 	// are empty with images not already saved for it.
-	if opt.previews > 0 {
+	{
 		for i := from; i < len(res.items); i++ {
 			it := &res.items[i]
 			if it.status != stHave && it.status != stGet {
 				continue
 			}
+			keep := opt.previewsFor(it.tag)
 			final := it.final(opt.rename)
 			current := final // where its previews are right now
 			if it.status == stHave {
@@ -1692,7 +1715,7 @@ func settle(res *planResult, st *stateFile, idx *index, opt planOptions, from in
 				}
 			}
 			next := 0
-			for slot := 1; slot <= opt.previews; slot++ {
+			for slot := 1; slot <= keep; slot++ {
 				if previewExists(current, slot) {
 					continue
 				}
@@ -2319,17 +2342,173 @@ func sortedKeys(m map[string]bool) []string {
 
 // ------------------------------------------------------------------ config
 
-func defaultConfigPath(home string) string {
-	if d, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(d, "civitai-likes", "config")
+// The config file is JSON. It holds:
+//   - settings: the default of every flag (command-line flags win for that run;
+//     -set-conf saves the ones given into the file);
+//   - newBaseModels: what to do when a base model turns up in the likes for the
+//     first time: "ask", "download" or "skip";
+//   - bases: per base model, whether its versions are downloaded, optional
+//     per-base previews and latest, and the liked models the tool has met with
+//     what became of each. "download": false on a model keeps that model from
+//     being downloaded for that base.
+// The tool rewrites only its own parts (names, statuses, files, help); the
+// choices are yours and are kept even when the file is edited during a run.
+
+const noBaseKey = "none" // config key for models that have no base model (upscalers)
+
+func baseKey(tag string) string {
+	if tag == "" {
+		return noBaseKey
 	}
-	return filepath.Join(home, ".config", "civitai-likes", "config")
+	return tag
 }
 
-// applyConfig sets every flag the config file names, unless the same flag
-// was given on the command line. Format: "flag = value" per line, # comments.
-// A missing file is fine; a bad line is an error naming the line.
-func applyConfig(path string) error {
+func keyTag(key string) string {
+	if key == noBaseKey {
+		return ""
+	}
+	return key
+}
+
+type confModel struct {
+	Name     string `json:"name"`
+	Type     string `json:"type,omitempty"`
+	Download bool   `json:"download"`
+	Status   string `json:"status"`
+	Version  string `json:"version,omitempty"`
+	File     string `json:"file,omitempty"`
+	Updated  string `json:"updated,omitempty"`
+}
+
+type confBase struct {
+	Name     string                `json:"name"`
+	Download *bool                 `json:"download"` // null: not chosen yet
+	Previews *int                  `json:"previews"`
+	Latest   *bool                 `json:"latest"`
+	Models   map[string]*confModel `json:"models"` // by Civitai model id
+}
+
+type config struct {
+	About         []string             `json:"about"`
+	NewBaseModels string               `json:"newBaseModels"`
+	Settings      map[string]any       `json:"settings"`
+	Help          map[string]string    `json:"help"`
+	Bases         map[string]*confBase `json:"bases"`
+
+	path     string
+	mtime    time.Time
+	imported string // the old flag = value file this one was made from
+}
+
+// Flags that are not settings: they steer the config itself.
+var notSettings = map[string]bool{"config": true, "print-config": true, "set-conf": true, "reconfig": true, "base": true}
+
+var configAbout = []string{
+	"moFlo config. Flags on the command line win for that run; add -set-conf to save them here.",
+	"settings: the default of every flag (see help). newBaseModels: \"ask\", \"download\" or \"skip\", for a base model that turns up in your likes for the first time.",
+	"bases: per base model, \"download\" true or false (null: not chosen yet, asked about); \"previews\" and \"latest\" override the settings for that base (null = use the setting).",
+	"bases.<base>.models: the liked models met so far, by Civitai model id. Set \"download\": false on one to stop it being downloaded for that base. The tool writes the rest.",
+}
+
+func defaultConfigPath(home string) string {
+	if d, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(d, "moflo", "config.json")
+	}
+	return filepath.Join(home, ".config", "moflo", "config.json")
+}
+
+// legacyConfigDir is where the tool kept its config when it was called
+// civitai-likes: config.json there, or the older flag = value file "config".
+func legacyConfigDir(home string) string {
+	return filepath.Join(filepath.Dir(filepath.Dir(defaultConfigPath(home))), "civitai-likes")
+}
+
+func loadConfig(path, legacyDir string) (*config, error) {
+	c := &config{path: path, NewBaseModels: "ask"}
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, c); err != nil {
+			return nil, configError(path, data, err)
+		}
+		if st, err := os.Stat(path); err == nil {
+			c.mtime = st.ModTime()
+		}
+	case errors.Is(err, os.ErrNotExist) && legacyDir != "":
+		old := filepath.Join(legacyDir, "config.json")
+		if data, err := os.ReadFile(old); err == nil { // civitai-likes' JSON config: same format
+			if err := json.Unmarshal(data, c); err != nil {
+				return nil, configError(old, data, err)
+			}
+			c.imported = old
+		} else if err := c.importLegacy(filepath.Join(legacyDir, "config")); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("config %s: %v", path, err)
+	}
+	return c, c.normalize()
+}
+
+func (c *config) normalize() error {
+	if c.Settings == nil {
+		c.Settings = map[string]any{}
+	}
+	if c.Bases == nil {
+		c.Bases = map[string]*confBase{}
+	}
+	for k, b := range c.Bases {
+		if b == nil {
+			b = &confBase{}
+			c.Bases[k] = b
+		}
+		if b.Models == nil {
+			b.Models = map[string]*confModel{}
+		}
+		for id, m := range b.Models {
+			if m == nil {
+				delete(b.Models, id)
+			}
+		}
+	}
+	c.NewBaseModels = strings.ToLower(strings.TrimSpace(c.NewBaseModels))
+	if c.NewBaseModels == "" {
+		c.NewBaseModels = "ask"
+	}
+	if c.NewBaseModels != "ask" && c.NewBaseModels != "download" && c.NewBaseModels != "skip" {
+		return fmt.Errorf("config %s: newBaseModels must be \"ask\", \"download\" or \"skip\", not %q", c.path, c.NewBaseModels)
+	}
+	return nil
+}
+
+// configError says where in the file a JSON mistake is.
+func configError(path string, data []byte, err error) error {
+	var off int64 = -1
+	var se *json.SyntaxError
+	var te *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &se):
+		off = se.Offset
+	case errors.As(err, &te):
+		off = te.Offset
+		err = fmt.Errorf("%s should be %s, not a JSON %s", te.Field, te.Type, te.Value)
+	}
+	if off < 0 {
+		return fmt.Errorf("config %s: %v", path, err)
+	}
+	line, col := 1, 1
+	for _, b := range data[:min(int(off), len(data))] {
+		if b == '\n' {
+			line, col = line+1, 1
+		} else {
+			col++
+		}
+	}
+	return fmt.Errorf("config %s line %d column %d: %v", path, line, col, err)
+}
+
+// importLegacy reads an old "flag = value" config file.
+func (c *config) importLegacy(path string) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -2337,8 +2516,7 @@ func applyConfig(path string) error {
 	if err != nil {
 		return fmt.Errorf("config %s: %v", path, err)
 	}
-	onCLI := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { onCLI[f.Name] = true })
+	c.Settings = map[string]any{}
 	for n, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -2348,44 +2526,522 @@ func applyConfig(path string) error {
 		key = strings.TrimLeft(strings.TrimSpace(key), "-")
 		val = strings.Trim(strings.TrimSpace(val), `"'`)
 		if !ok {
-			key, val = strings.TrimLeft(line, "-"), "true" // a bare boolean flag
+			key, val = strings.TrimLeft(line, "-"), "true"
 		}
-		if key == "config" || key == "print-config" {
-			return fmt.Errorf("config %s line %d: %q cannot be set in the config file", path, n+1, key)
-		}
-		if flag.Lookup(key) == nil {
-			return fmt.Errorf("config %s line %d: no flag called %q (civitai-likes -h lists them)", path, n+1, key)
-		}
-		if onCLI[key] {
+		if key == "base" {
+			set, all := parseBases(val)
+			if all {
+				c.NewBaseModels = "download"
+			}
+			for t := range set {
+				c.base(baseKey(t)).Download = boolp(true)
+			}
 			continue
 		}
-		if err := flag.Set(key, val); err != nil {
+		if notSettings[key] {
+			continue
+		}
+		f := flag.Lookup(key)
+		if f == nil {
+			return fmt.Errorf("config %s line %d: no flag called %q", path, n+1, key)
+		}
+		v, err := typedValue(f, val)
+		if err != nil {
 			return fmt.Errorf("config %s line %d: %s = %s: %v", path, n+1, key, val, err)
+		}
+		c.Settings[key] = v
+	}
+	c.imported = path
+	return nil
+}
+
+// typedValue turns a flag value written as text into the JSON type of that flag.
+func typedValue(f *flag.Flag, s string) (any, error) {
+	switch f.Value.(flag.Getter).Get().(type) {
+	case bool:
+		return strconv.ParseBool(s)
+	case int:
+		return strconv.Atoi(s)
+	}
+	return s, nil
+}
+
+func settingText(v any) (string, bool) {
+	switch v := v.(type) {
+	case bool:
+		return strconv.FormatBool(v), true
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	case int:
+		return strconv.Itoa(v), true
+	case string:
+		return v, true
+	}
+	return "", false
+}
+
+// applySettings sets every flag the settings name, except those given on the
+// command line.
+func (c *config) applySettings(onCLI map[string]bool) error {
+	for _, k := range slices.Sorted(maps.Keys(c.Settings)) {
+		v := c.Settings[k]
+		if v == nil {
+			continue // null: the built-in default
+		}
+		if notSettings[k] {
+			return fmt.Errorf("config %s: %q is not a setting (it only works on the command line)", c.path, k)
+		}
+		f := flag.Lookup(k)
+		if f == nil {
+			return fmt.Errorf("config %s: settings has %q, but there is no such flag (moflo -h lists them)", c.path, k)
+		}
+		if onCLI[k] {
+			continue
+		}
+		s, ok := settingText(v)
+		if !ok {
+			return fmt.Errorf("config %s: settings %q should be true/false, a number or a string", c.path, k)
+		}
+		if err := flag.Set(k, s); err != nil {
+			return fmt.Errorf("config %s: settings %q = %v: %v", c.path, k, v, err)
 		}
 	}
 	return nil
 }
 
-// writeConfig prints the settings in effect as a config file.
-func writeConfig(w io.Writer, path string) {
-	fmt.Fprintf(w, "# civitai-likes config (%s)\n", path)
-	fmt.Fprintln(w, "# flag = value; flags given on the command line win. Booleans: true / false.")
-	flag.VisitAll(func(f *flag.Flag) {
-		if f.Name == "config" || f.Name == "print-config" {
+// setFromCLI saves the flags given on the command line as settings (-set-conf).
+// -n is never saved: a file that makes every run a dry run helps nobody.
+func (c *config) setFromCLI(onCLI map[string]bool) []string {
+	var saved []string
+	flag.Visit(func(f *flag.Flag) { // flag.Visit also sees what the config set: only take the command line's
+		if !onCLI[f.Name] || notSettings[f.Name] || f.Name == "n" {
 			return
 		}
-		usage := strings.ReplaceAll(f.Usage, "\n", "\n# ")
-		fmt.Fprintf(w, "\n# %s\n%s = %s\n", usage, f.Name, f.Value.String())
+		c.Settings[f.Name] = f.Value.(flag.Getter).Get()
+		saved = append(saved, fmt.Sprintf("%s = %v", f.Name, f.Value.String()))
+	})
+	return saved
+}
+
+// fill adds every setting the file lacks at its built-in default, and the help.
+func (c *config) fill() {
+	c.About = configAbout
+	c.Help = map[string]string{}
+	flag.VisitAll(func(f *flag.Flag) {
+		if notSettings[f.Name] {
+			return
+		}
+		c.Help[f.Name] = strings.Join(strings.Fields(f.Usage), " ")
+		if _, ok := c.Settings[f.Name]; !ok {
+			if v, err := typedValue(f, f.DefValue); err == nil {
+				c.Settings[f.Name] = v
+			}
+		}
 	})
 }
 
+func boolp(b bool) *bool { return &b }
+
+func (b *confBase) on() bool { return b.Download != nil && *b.Download }
+
+func (c *config) base(key string) *confBase {
+	b := c.Bases[key]
+	if b == nil {
+		b = &confBase{Models: map[string]*confModel{}}
+		if c.Bases == nil {
+			c.Bases = map[string]*confBase{}
+		}
+		c.Bases[key] = b
+	}
+	return b
+}
+
+// save writes the file. When it was changed on disk since it was read (edited
+// during a run), the choices in it are taken over first, so none are lost.
+func (c *config) save() error {
+	if st, err := os.Stat(c.path); err == nil && !st.ModTime().Equal(c.mtime) {
+		if data, err := os.ReadFile(c.path); err == nil {
+			disk := &config{path: c.path}
+			if json.Unmarshal(data, disk) == nil && disk.normalize() == nil {
+				c.adopt(disk)
+			}
+		}
+	}
+	c.fill()
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
+		return err
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		return err
+	}
+	if st, err := os.Stat(c.path); err == nil {
+		c.mtime = st.ModTime()
+	}
+	return nil
+}
+
+func (c *config) saveOrWarn() {
+	if err := c.save(); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not save", c.path+":", err)
+	}
+}
+
+// adopt takes the user's choices from the copy on disk.
+func (c *config) adopt(disk *config) {
+	c.Settings, c.NewBaseModels = disk.Settings, disk.NewBaseModels
+	for k, db := range disk.Bases {
+		mb := c.Bases[k]
+		if mb == nil {
+			c.Bases[k] = db
+			continue
+		}
+		mb.Download, mb.Previews, mb.Latest = db.Download, db.Previews, db.Latest
+		for id, dm := range db.Models {
+			if mm := mb.Models[id]; mm != nil {
+				mm.Download = dm.Download
+			} else {
+				mb.Models[id] = dm
+			}
+		}
+	}
+}
+
+// effective prints the config as it applies to this run (-print-config).
+func (c *config) effective(onCLI map[string]bool) ([]byte, error) {
+	cp := *c
+	cp.Settings = maps.Clone(c.Settings)
+	cp.fill()
+	flag.Visit(func(f *flag.Flag) {
+		if onCLI[f.Name] && !notSettings[f.Name] {
+			cp.Settings[f.Name] = f.Value.(flag.Getter).Get()
+		}
+	})
+	return json.MarshalIndent(&cp, "", "  ")
+}
+
+// ------------------------------------------------------- choosing base models
+
+type likedBase struct {
+	key, name string
+	count     int // liked models with a version for it
+}
+
+// likedBases lists the base models in the likes, most liked first.
+func likedBases(models []apiModel) []likedBase {
+	by := map[string]*likedBase{}
+	for _, m := range models {
+		if _, ok := typeDirs[m.Type]; !ok {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, v := range m.ModelVersions {
+			key, name := noBaseKey, "No base model (upscalers)"
+			if !baseAgnostic[m.Type] {
+				key, name = baseKey(baseTag(v.BaseModel)), strings.TrimSpace(v.BaseModel)
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			lb := by[key]
+			if lb == nil {
+				lb = &likedBase{key: key, name: name}
+				by[key] = lb
+			}
+			lb.count++
+		}
+	}
+	out := make([]likedBase, 0, len(by))
+	for _, lb := range by {
+		out = append(out, *lb)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].count != out[j].count {
+			return out[i].count > out[j].count
+		}
+		return out[i].key < out[j].key
+	})
+	return out
+}
+
+var stdin = bufio.NewReader(os.Stdin)
+
+// parsePicks reads "1 2 3", "1,2,3", "2-5", "all" or "none" against n choices.
+func parsePicks(answer string, n int) (map[int]bool, error) {
+	picks := map[int]bool{}
+	for _, tok := range strings.FieldsFunc(answer, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		switch strings.ToLower(tok) {
+		case "all":
+			for i := 1; i <= n; i++ {
+				picks[i] = true
+			}
+			continue
+		case "none":
+			continue
+		}
+		lo, hi, isRange := strings.Cut(tok, "-")
+		a, err1 := strconv.Atoi(lo)
+		b, err2 := a, error(nil)
+		if isRange {
+			b, err2 = strconv.Atoi(hi)
+		}
+		if err1 != nil || err2 != nil || a < 1 || b > n || a > b {
+			return nil, fmt.Errorf("%q is not a number from 1 to %d", tok, n)
+		}
+		for i := a; i <= b; i++ {
+			picks[i] = true
+		}
+	}
+	return picks, nil
+}
+
+// chooseBases makes sure every base model in the likes has a download choice.
+// The first time, for new ones when newBaseModels is "ask", and with -reconfig,
+// it lists them and asks. It reports whether anything changed.
+func (c *config) chooseBases(liked []likedBase, reconfig, noAsk bool) (bool, error) {
+	first := true
+	for _, b := range c.Bases {
+		if b.Download != nil {
+			first = false
+		}
+	}
+	var fresh []string
+	list := append([]likedBase(nil), liked...)
+	inLikes := map[string]bool{}
+	for _, lb := range liked {
+		inLikes[lb.key] = true
+		b := c.base(lb.key)
+		if b.Download == nil {
+			fresh = append(fresh, lb.key)
+		}
+		if lb.name != "" {
+			b.Name = lb.name
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(c.Bases)) { // chosen before, no longer in the likes
+		if !inLikes[k] {
+			list = append(list, likedBase{key: k, name: c.Bases[k].Name})
+		}
+	}
+	isFresh := func(k string) bool { return slices.Contains(fresh, k) }
+	if !reconfig && len(fresh) == 0 {
+		return false, nil
+	}
+	if !reconfig && !first && c.NewBaseModels != "ask" {
+		for _, k := range fresh {
+			c.Bases[k].Download = boolp(c.NewBaseModels == "download")
+		}
+		fmt.Printf("New base model(s) in your likes: %s; %s, as newBaseModels says.\n",
+			strings.Join(fresh, ", "), map[bool]string{true: "downloading them", false: "not downloading them"}[c.NewBaseModels == "download"])
+		return true, nil
+	}
+	if noAsk {
+		if reconfig {
+			return false, errors.New("-reconfig asks which base models to download; leave out -yes")
+		}
+		for _, k := range fresh {
+			c.Bases[k].Download = boolp(first)
+		}
+		if first {
+			fmt.Println("First run with -yes: every base model in your likes is set to download. Pick with -reconfig,")
+			fmt.Printf("or set \"download\" under each base model in %s.\n", c.path)
+		} else {
+			fmt.Printf("New base model(s) in your likes, not downloaded (-yes cannot ask): %s\n", strings.Join(fresh, ", "))
+			fmt.Printf("Turn one on with -reconfig, or \"download\": true under it in %s.\n", c.path)
+		}
+		return true, nil
+	}
+
+	switch {
+	case first:
+		fmt.Println("\nBase models in your likes. Which should be downloaded?")
+	case reconfig:
+		fmt.Println("\nBase models (x = downloaded now). Which should be downloaded?")
+	default:
+		fmt.Println("\nNew base models turned up in your likes (marked new). Which should be downloaded?")
+	}
+	for i, lb := range list {
+		mark := "   "
+		if c.Bases[lb.key].on() {
+			mark = "[x]"
+		}
+		extra := fmt.Sprintf("%3d liked", lb.count)
+		if !inLikes[lb.key] {
+			extra = "  0 liked"
+		}
+		if isFresh(lb.key) && !first {
+			extra += "  new"
+		}
+		name := lb.name
+		if name == "" {
+			name = lb.key
+		}
+		fmt.Printf("  %s %2d  %-26s %-16s %s\n", mark, i+1, name, lb.key, extra)
+	}
+	enter := "keep as marked"
+	if first {
+		enter = "all"
+	}
+	var picks map[int]bool
+	for tries := 0; ; tries++ {
+		fmt.Printf("Numbers like 1 2 3 or 1,2,3 (ranges like 2-5, all, none) [Enter = %s]: ", enter)
+		answer, err := stdin.ReadString('\n')
+		answer = strings.TrimSpace(answer)
+		if answer == "" {
+			if err != nil {
+				fmt.Println()
+			}
+			break // keep as marked (first run: all)
+		}
+		p, perr := parsePicks(answer, len(list))
+		if perr == nil {
+			picks = p
+			break
+		}
+		fmt.Println("  " + perr.Error())
+		if err != nil || tries >= 4 {
+			return false, errors.New("no usable answer; nothing chosen")
+		}
+	}
+	for i, lb := range list {
+		b := c.Bases[lb.key]
+		switch {
+		case picks != nil:
+			b.Download = boolp(picks[i+1])
+		case first:
+			b.Download = boolp(true)
+		case isFresh(lb.key):
+			b.Download = boolp(false)
+		}
+	}
+	var on []string
+	for _, lb := range list {
+		if c.Bases[lb.key].on() {
+			on = append(on, lb.key)
+		}
+	}
+	if len(on) == 0 {
+		on = []string{"none"}
+	}
+	fmt.Printf("Downloading: %s\n", strings.Join(on, ", "))
+	fmt.Printf("Saved to %s. Change it there (\"download\" under each base model) or run with -reconfig.\n\n", c.path)
+	return true, nil
+}
+
+// enabled is the set of base model tags to download ("" for no base model).
+func (c *config) enabled() map[string]bool {
+	set := map[string]bool{}
+	for k, b := range c.Bases {
+		if b.on() {
+			set[keyTag(k)] = true
+		}
+	}
+	return set
+}
+
+// ------------------------------------------------------ what became of models
+
+func modelKey(tag string, id int64) string { return baseKey(tag) + "/" + strconv.FormatInt(id, 10) }
+
+// blocked lists the models set to "download": false, by modelKey.
+func (c *config) blocked() map[string]bool {
+	out := map[string]bool{}
+	for k, b := range c.Bases {
+		for id, m := range b.Models {
+			if !m.Download {
+				out[k+"/"+id] = true
+			}
+		}
+	}
+	return out
+}
+
+// note records what became of one liked model for one base model.
+func (c *config) note(it item, status, file string) {
+	if it.local || it.model.ID == 0 {
+		return
+	}
+	if it.tag == "" && !baseAgnostic[it.model.Type] {
+		return // not a model ComfyUI loads, or nothing downloadable: no base to file it under
+	}
+	b := c.base(baseKey(it.tag))
+	id := strconv.FormatInt(it.model.ID, 10)
+	m := b.Models[id]
+	if m == nil {
+		m = &confModel{Download: true}
+		b.Models[id] = m
+	}
+	m.Name, m.Type = it.model.Name, it.model.Type
+	if it.ver.Name != "" {
+		m.Version = it.ver.Name
+	}
+	if file != "" {
+		m.File = file
+	}
+	if m.Status != status {
+		m.Status = status
+		m.Updated = time.Now().Format("2006-01-02")
+	}
+}
+
+// statusOf says in words what the plan is for an item.
+func statusOf(it item) string {
+	switch it.status {
+	case stHave:
+		return "on disk"
+	case stGet:
+		if it.ea {
+			return "to download (early access until " + eaUntil(it.ver.EarlyAccessEndsAt) + ")"
+		}
+		return "to download"
+	case stWait:
+		return "held back: " + it.note
+	case stAlone:
+		return "left alone: " + it.note
+	case stOff:
+		return "base model not downloaded"
+	}
+	return "skipped: " + it.note
+}
+
+// noteAll records the plan for every liked model, and marks the models met
+// before that are no longer liked.
+func (c *config) noteAll(items []item, models []apiModel, idx *index) {
+	for _, it := range items {
+		file := ""
+		if it.status == stHave {
+			file = idx.rel(it.found)
+		}
+		c.note(it, statusOf(it), file)
+	}
+	liked := map[string]bool{}
+	for _, m := range models {
+		liked[strconv.FormatInt(m.ID, 10)] = true
+	}
+	for _, b := range c.Bases {
+		for id, m := range b.Models {
+			if !liked[id] && m.Status != "no longer liked" {
+				m.Status, m.Updated = "no longer liked", time.Now().Format("2006-01-02")
+			}
+		}
+	}
+}
+
 // baseTally counts what a run found for one base model's liked files.
-type baseTally struct{ have, get, wait, alone int }
+type baseTally struct{ have, get, wait, alone, off int }
 
 func tallyBases(items []item) map[string]*baseTally {
 	per := map[string]*baseTally{}
 	for _, it := range items {
-		if it.local || it.tag == "" {
+		if it.local || (it.tag == "" && !baseAgnostic[it.model.Type]) {
 			continue
 		}
 		c := per[it.tag]
@@ -2402,6 +3058,10 @@ func tallyBases(items []item) map[string]*baseTally {
 			c.wait++
 		case stAlone:
 			c.alone++
+		case stSkip:
+			if strings.Contains(it.note, "in the config") {
+				c.off++
+			}
 		}
 	}
 	return per
@@ -2437,7 +3097,7 @@ func run() int {
 		"by the base model their own metadata names, when it names one")
 	latest := flag.Bool("latest", false, "fetch the newest version even when an older version is on disk")
 	maxModels := flag.Int("max", 1000, "refuse to act on a likes list longer than this")
-	stateOpt := flag.String("state", "", "state file (default <models>/.civitai-likes.json)")
+	stateOpt := flag.String("state", "", "state file (default <models>/.moflo.json)")
 	tokenFile := flag.String("token-file", filepath.Join(home, ".config", "civitai", "token"), "file holding the API token")
 	apiBase := flag.String("api", "https://civitai.com", "Civitai base URL")
 	tagFlag := flag.String("tag", "front", "where the base model tag goes in file names:\n"+
@@ -2446,16 +3106,68 @@ func run() int {
 		"  dot     name.flux1_dev.safetensors\n"+
 		"  folder  loras/flux1_dev/name.safetensors\n"+
 		"  none    Civitai's name, untouched")
-	configPath := flag.String("config", defaultConfigPath(home), "config file with default flags (command-line flags override it)")
-	printConfig := flag.Bool("print-config", false, "print the settings in effect, in config file form, and exit")
+	configPath := flag.String("config", defaultConfigPath(home), "config file (JSON): flag defaults, base models to download, and per base\n"+
+		"model the liked models with what became of them. Command-line flags win for that run")
+	printConfig := flag.Bool("print-config", false, "print the config as it applies to this run, and exit")
+	setConf := flag.Bool("set-conf", false, "save the flags given on the command line into the config file as the new\n"+
+		"defaults (-base sets which base models are downloaded); -n is never saved")
+	reconfig := flag.Bool("reconfig", false, "list the base models in your likes again and ask which to download")
 	flag.Parse()
-	if err := applyConfig(*configPath); err != nil {
+	onCLI := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { onCLI[f.Name] = true })
+	legacy := ""
+	if !onCLI["config"] {
+		legacy = legacyConfigDir(home)
+	}
+	cfg, err := loadConfig(*configPath, legacy)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if err := cfg.applySettings(onCLI); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	if *printConfig {
-		writeConfig(os.Stdout, *configPath)
+		data, err := cfg.effective(onCLI)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		fmt.Println(string(data))
 		return 0
+	}
+	if cfg.imported != "" {
+		if err := cfg.save(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		fmt.Printf("Imported %s into %s; the old file is no longer read (delete it when you like).\n", cfg.imported, cfg.path)
+	}
+	if *setConf {
+		saved := cfg.setFromCLI(onCLI)
+		if onCLI["base"] {
+			set, all := parseBases(*baseSpec)
+			if all {
+				cfg.NewBaseModels = "download"
+			}
+			for _, b := range cfg.Bases {
+				b.Download = boolp(all)
+			}
+			for t := range set {
+				cfg.base(baseKey(t)).Download = boolp(true)
+			}
+			saved = append(saved, "base = "+*baseSpec)
+		}
+		if err := cfg.save(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		if len(saved) == 0 {
+			fmt.Println("-set-conf: no flags given to save.")
+		} else {
+			fmt.Printf("Saved to %s: %s\n", cfg.path, strings.Join(saved, ", "))
+		}
 	}
 	tagMode = strings.ToLower(strings.TrimSpace(*tagFlag))
 	if !slices.Contains(tagModes, tagMode) {
@@ -2525,7 +3237,18 @@ func run() int {
 	}
 	statePath := *stateOpt
 	if statePath == "" {
-		statePath = filepath.Join(root, ".civitai-likes.json")
+		statePath = filepath.Join(root, ".moflo.json")
+		// Renamed from civitai-likes: carry its state file over once.
+		old := filepath.Join(root, ".civitai-likes.json")
+		if _, err := os.Lstat(statePath); errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Lstat(old); err == nil {
+				if err := os.Rename(old, statePath); err != nil {
+					fmt.Fprintln(os.Stderr, "could not move the old state file:", err)
+					return 2
+				}
+				fmt.Printf("Moved %s to %s (the tool is now called moFlo).\n", old, statePath)
+			}
+		}
 	}
 	if statePath, err = filepath.Abs(statePath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -2550,6 +3273,21 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "could not get the liked models:", err)
 		return 1
 	}
+	if !onCLI["base"] { // which base models: from the config, asking about new ones
+		changed, err := cfg.chooseBases(likedBases(models), *reconfig, *yes)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		if changed {
+			if err := cfg.save(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 2
+			}
+		}
+	} else if *reconfig {
+		fmt.Fprintln(os.Stderr, "note: -reconfig is ignored with -base")
+	}
 
 	scanStart := time.Now()
 	idx, err := buildIndex(root, map[string]bool{statePath: true, statePath + ".tmp": true})
@@ -2566,14 +3304,34 @@ func run() int {
 	st.LastScan = scanStart
 	st.saveOrWarn()
 
-	opt := planOptions{latest: *latest, rename: *rename, previews: *previews}
-	opt.bases, opt.all = parseBases(*baseSpec)
+	opt := planOptions{latest: *latest, rename: *rename, previews: *previews,
+		blocked: cfg.blocked(), basePreviews: map[string]int{}, baseLatest: map[string]bool{}}
+	if onCLI["base"] {
+		opt.bases, opt.all = parseBases(*baseSpec)
+	} else {
+		opt.bases = cfg.enabled()
+	}
+	for k, b := range cfg.Bases { // per base model settings, unless the flag was given for this run
+		if b.Previews != nil && !onCLI["previews"] && !*renameOnly {
+			opt.basePreviews[keyTag(k)] = max(*b.Previews, 0)
+		}
+		if b.Latest != nil && !onCLI["latest"] {
+			opt.baseLatest[keyTag(k)] = *b.Latest
+		}
+	}
 	fmt.Printf("Liked models: %d\n", len(models))
 	fmt.Printf("Files under %s: %d (%s)\n", root, len(idx.all), human(idx.bytes))
 	if opt.all {
 		fmt.Println("Base models: all")
 	} else {
-		fmt.Println("Base models:", strings.Join(sortedKeys(opt.bases), ", "))
+		var on []string
+		for _, t := range sortedKeys(opt.bases) {
+			on = append(on, baseKey(t))
+		}
+		if len(on) == 0 {
+			on = []string{"none chosen (-reconfig to pick)"}
+		}
+		fmt.Println("Base models:", strings.Join(on, ", "))
 	}
 	if !st.existed {
 		fmt.Println("First run: file sizes and dates recorded. Nothing is checksummed except downloads;")
@@ -2581,7 +3339,9 @@ func run() int {
 	}
 
 	for t := range opt.bases {
-		knownTags[t] = true
+		if t != "" {
+			knownTags[t] = true
+		}
 	}
 	for _, m := range models {
 		for _, v := range m.ModelVersions {
@@ -2611,6 +3371,9 @@ func run() int {
 	}
 	st.saveOrWarn()
 	tallies := tallyBases(res.items) // before anything is filtered out of the list
+	if !*dryRun {
+		cfg.noteAll(slices.Concat(res.items, res.off), models, idx)
+	}
 	items := res.items
 	notOnDisk := 0
 	if *previewsOnly || *renameOnly {
@@ -2633,6 +3396,13 @@ func run() int {
 			return 130
 		}
 		tallies = tallyBases(items) // now with what is held back
+		if !*dryRun {
+			for _, it := range items {
+				if it.status == stWait || it.status == stGet {
+					cfg.note(it, statusOf(it), "")
+				}
+			}
+		}
 
 	}
 	if eaOnly {
@@ -2650,6 +3420,9 @@ func run() int {
 			kept = append(kept, it)
 		}
 		items = kept
+	}
+	if !*dryRun {
+		cfg.saveOrWarn() // the plan for every liked model, before anything happens
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := strings.ToLower(items[i].model.Name), strings.ToLower(items[j].model.Name)
@@ -2763,20 +3536,27 @@ func run() int {
 			}
 			return tags[i] < tags[j]
 		})
-		fmt.Println("\nOther base models in your likes, not selected (add one with -base +tag):")
+		if onCLI["base"] {
+			fmt.Println("\nOther base models in your likes, not selected (add one with -base +tag):")
+		} else {
+			fmt.Printf("\nOther base models in your likes, not downloaded (turn one on with -reconfig, or\n\"download\": true under it in %s):\n", cfg.path)
+		}
 		for _, t := range tags {
 			name := res.names[t]
-			if name == "" {
+			switch {
+			case t == "":
+				name = "upscalers and other models with no base model"
+			case name == "":
 				name = "no base model given"
 			}
-			fmt.Printf("  %-22s %3d   (Civitai: %s)\n", t, res.others[t], name)
+			fmt.Printf("  %-22s %3d   (Civitai: %s)\n", baseKey(t), res.others[t], name)
 		}
 	}
 	if !opt.all {
 		var missing []string
 		for _, t := range sortedKeys(opt.bases) {
 			if !res.matched[t] {
-				missing = append(missing, t)
+				missing = append(missing, baseKey(t))
 			}
 		}
 		if len(missing) > 0 {
@@ -2832,19 +3612,22 @@ func run() int {
 			if c == nil {
 				c = &baseTally{}
 			}
-			if c.have+c.get+c.wait+c.alone == 0 {
-				fmt.Printf("  %-16s none liked (check the tag: the full list of tags in your likes is printed by -base all -n)\n", t)
+			if c.have+c.get+c.wait+c.alone+c.off == 0 {
+				fmt.Printf("  %-16s none liked (check the tag: the full list of tags in your likes is printed by -base all -n)\n", baseKey(t))
 				continue
 			}
-			line := fmt.Sprintf("  %-16s %d on disk, %d to download", t, c.have, c.get)
+			line := fmt.Sprintf("  %-16s %d on disk, %d to download", baseKey(t), c.have, c.get)
 			if *renameOnly || *previewsOnly {
-				line = fmt.Sprintf("  %-16s %d on disk (%d not on disk, not downloaded in this mode)", t, c.have, c.get)
+				line = fmt.Sprintf("  %-16s %d on disk (%d not on disk, not downloaded in this mode)", baseKey(t), c.have, c.get)
 			}
 			if c.wait > 0 {
 				line += fmt.Sprintf(", %d held back (refused before)", c.wait)
 			}
 			if c.alone > 0 {
 				line += fmt.Sprintf(", %d left alone (see above)", c.alone)
+			}
+			if c.off > 0 {
+				line += fmt.Sprintf(", %d switched off in the config", c.off)
 			}
 			fmt.Println(line)
 		}
@@ -2969,7 +3752,7 @@ func run() int {
 		}
 		question := strings.Join(parts, ", ")
 		fmt.Printf("%s%s? [y/N] ", strings.ToUpper(question[:1]), question[1:])
-		answer, rerr := bufio.NewReader(os.Stdin).ReadString('\n')
+		answer, rerr := stdin.ReadString('\n')
 		if rerr != nil && strings.TrimSpace(answer) == "" {
 			fmt.Println("\nNo answer to read: rerun with -yes to go ahead.")
 			return 1
@@ -3056,6 +3839,7 @@ func run() int {
 				st.Files[idx.rel(to)] = e
 			}
 			fmt.Printf("renamed %s  ->  %s\n", idx.rel(it.found), idx.rel(to))
+			cfg.note(it, "on disk", idx.rel(to))
 			for _, sc := range it.sidecars {
 				if _, err := os.Lstat(sc[1]); err == nil {
 					continue
@@ -3112,6 +3896,7 @@ func run() int {
 				}
 				st.EarlyAccess[vid] = rec
 				eaNoted++
+				cfg.note(it, "refused by Civitai: "+err.Error(), "")
 				if _, ok := parseTime(rec.EndsAt); ok && it.ea {
 					fmt.Fprintf(os.Stderr, "    refused: not tried again until early access ends (%s), or with -ea\n", eaUntil(rec.EndsAt))
 				} else {
@@ -3120,11 +3905,15 @@ func run() int {
 				st.saveOrWarn()
 			} else {
 				failed = append(failed, fmt.Sprintf("%s: %v", label(it), err))
+				cfg.note(it, "download failed: "+err.Error(), "")
 			}
+			cfg.saveOrWarn()
 			continue
 		}
 		delete(st.EarlyAccess, vid)
 		ok++
+		cfg.note(it, "on disk", idx.rel(it.dest))
+		cfg.saveOrWarn()
 		if it.file.sha256() != "" {
 			fmt.Println("    saved, checksum verified")
 		} else {
@@ -3135,6 +3924,7 @@ func run() int {
 		got += fetchThumbs(it)
 	}
 	st.saveOrWarn()
+	cfg.saveOrWarn()
 	var summary []string
 	if count > 0 {
 		summary = append(summary, fmt.Sprintf("Downloaded %d of %d model(s).", ok, count))

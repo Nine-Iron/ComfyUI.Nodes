@@ -7,9 +7,9 @@ Four small tools for working with models and prompts in [ComfyUI](https://github
 | [`Lora.Tag.Picker/`](#lora-tag-picker) | Custom node | Reads the training tags out of the LoRAs you have loaded and adds the ones you pick to your prompt. |
 | [`Prompt.Generator/`](#prompt-generator) | Custom nodes | Makes random prompts, from wildcard templates or by asking a language model (Claude, ChatGPT, or a local server). |
 | [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, with the prompt and settings each preview was made with, and lets you hide base models you don't use. |
-| [`CivitAI.Model.Plus.Preview.Picker/`](#civitai-likes) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
+| [`moFlo/`](#moflo) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
 
-Each one works on its own, and they work well together: civitai-likes saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
+Each one works on its own, and they work well together: moFlo saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
 
 ## Contents
 
@@ -18,7 +18,7 @@ Each one works on its own, and they work well together: civitai-likes saves prev
 - [LoRA Tag Picker](#lora-tag-picker)
 - [Prompt Generator](#prompt-generator)
 - [Model Preview Popup](#model-preview-popup)
-- [civitai-likes](#civitai-likes)
+- [moFlo](#moflo)
 - [HTTP routes](#http-routes)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -26,7 +26,7 @@ Each one works on its own, and they work well together: civitai-likes saves prev
 ## Requirements
 
 - **ComfyUI pieces:** a recent ComfyUI with the new frontend (the Model Library sidebar and DOM widgets). Nothing else to install: they use only the Python standard library and what ComfyUI already ships.
-- **civitai-likes:** Go 1.21 or later to build it (standard library only), and a Civitai API key.
+- **moFlo:** Go 1.21 or later to build it (standard library only), and a Civitai API key.
 
 ## Install
 
@@ -195,17 +195,17 @@ The settings come from, first match wins:
 
 | Source | Where it comes from |
 | --- | --- |
-| `<name>.preview.json`, `<name>.preview-N.json` | Saved by civitai-likes beside each preview it downloads: what Civitai records for that image. For previews downloaded before, run `civitai-likes -previews-only -preview-info` once. |
+| `<name>.preview.json`, `<name>.preview-N.json` | Saved by moFlo beside each preview it downloads: what Civitai records for that image. For previews downloaded before, run `moflo -previews-only -preview-info` once. |
 | Metadata inside the picture | A1111 / Forge `parameters` (PNG text, or JPEG/WebP EXIF), or the ComfyUI prompt graph in a PNG or WebP saved by ComfyUI. Your own renders dropped beside a model show their settings this way. |
 
-A plain `<name>.<ext>` preview only uses metadata inside the picture, since `<name>.json` beside a model is the model's own info file. Civitai's resized images do not keep embedded metadata, which is why civitai-likes saves the settings separately.
+A plain `<name>.<ext>` preview only uses metadata inside the picture, since `<name>.json` beside a model is the model's own info file. Civitai's resized images do not keep embedded metadata, which is why moFlo saves the settings separately.
 
 ### Base models
 
 The top of the popup names the model's base model (for example **Flux.1 D**). It is worked out in this order:
 
-1. The civitai-likes state file (`<models>/.civitai-likes.json`), for files civitai-likes downloaded or identified.
-2. A tag in the file or folder name, in any of the forms civitai-likes writes: `flux1_dev_x`, `x_flux1_dev`, `x.flux1_dev`, or a `flux1_dev/` folder.
+1. The moFlo state file (`<models>/.moflo.json`), for files moFlo downloaded or identified.
+2. A tag in the file or folder name, in any of the forms moFlo writes: `flux1_dev_x`, `x_flux1_dev`, `x.flux1_dev`, or a `flux1_dev/` folder.
 3. The base model the file itself records (`ss_base_model_version` or `modelspec.architecture`).
 4. A guess from the tensor names in the file header. The label's tooltip says when it was guessed.
 
@@ -213,20 +213,22 @@ Anything left over is **Unknown**.
 
 The **Base models** button in the popup opens a list of every base model found, with a file count for each. Untick a base model to hide its files from the Model Library and from loader dropdowns in the graph. A model already chosen in a node stays visible there. The filter applies to `checkpoints`, `loras`, `diffusion_models`, `unet`, `embeddings`, `controlnet`, and `hypernetworks`; text encoders, VAEs, and upscalers are always shown. The choice is saved in your ComfyUI user settings, so it follows you across browsers.
 
-## civitai-likes
+## moFlo
 
 A command-line tool that downloads the models you have liked on Civitai into your ComfyUI models folder, without ever fetching one you already have. It also saves preview images in the layout Model Preview Popup reads, can tag file names with their base model, and can identify model files you got elsewhere.
+
+moFlo was called civitai-likes. Its first run carries everything over: the config (`~/.config/civitai-likes/config.json`, or the older `config` file beside it; on macOS, under `~/Library/Application Support/civitai-likes/`) is imported into `~/.config/moflo/config.json`, and the state file `<models>/.civitai-likes.json` is moved to `<models>/.moflo.json`. Model Preview Popup reads either state file, so nothing breaks in between. The API token stays where it was (`CIVITAI_TOKEN` or `~/.config/civitai/token`).
 
 ### Setup
 
 Build it (Go 1.21+, standard library only):
 
 ```sh
-cd "CivitAI.Model.Plus.Preview.Picker"
-go build -o civitai-likes civitai.likes.go
+cd "moFlo"
+go build -o moflo moflo.go
 ```
 
-A prebuilt `civitai.likes.linux.arm64` binary is included for 64-bit ARM Linux. To build for another platform, set `GOOS` and `GOARCH`, for example `GOOS=windows GOARCH=amd64 go build -o civitai-likes.exe civitai.likes.go`.
+A prebuilt `moflo.linux.arm64` binary is included for 64-bit ARM Linux. To build for another platform, set `GOOS` and `GOARCH`, for example `GOOS=windows GOARCH=amd64 go build -o moflo.exe moflo.go`.
 
 Create an API key at <https://civitai.com/user/account>, then either export it or save it to a file:
 
@@ -241,23 +243,25 @@ The environment variable wins when both are set.
 ### Usage
 
 ```sh
-civitai-likes -n                 # show what would happen, change nothing
-civitai-likes                    # show the plan, ask, then download (every base model)
-civitai-likes -yes               # no question asked
-civitai-likes -base pony         # only Pony models
-civitai-likes -base sdxl1,sd1    # only these base models
-civitai-likes -previews 4        # keep up to 4 preview images per model
-civitai-likes -previews-only     # only fetch missing previews for models you have
-civitai-likes -previews-only -preview-info   # also save generation settings for previews you already have
-civitai-likes -rename            # also rename files you already have to the tagged form
-civitai-likes -rename-only       # only rename, no downloads or previews
-civitai-likes -rename-only -local          # also rename files that are not liked models, looked up by checksum
-civitai-likes -rename-only -local -guess   # and tag the ones Civitai does not know from their metadata
-civitai-likes -tag folder -rename-only     # switch to loras/flux1_dev/x.safetensors style
-civitai-likes -latest            # also fetch the newest version when you hold an older one
-civitai-likes -checksum          # checksum every model file now (slow, once)
-civitai-likes -ea                # only retry early access versions refused before
-civitai-likes -ea -all           # retry those, and do everything a normal run does
+moflo -n                 # show what would happen, change nothing
+moflo                    # first run: pick base models; then show the plan, ask, download
+moflo -yes               # no question asked
+moflo -reconfig          # pick again which base models are downloaded
+moflo -base pony         # only Pony models, this run
+moflo -base sdxl1,sd1    # only these base models, this run
+moflo -set-conf -previews 3 -tag folder   # save these as the defaults in the config file
+moflo -previews 4        # keep up to 4 preview images per model
+moflo -previews-only     # only fetch missing previews for models you have
+moflo -previews-only -preview-info   # also save generation settings for previews you already have
+moflo -rename            # also rename files you already have to the tagged form
+moflo -rename-only       # only rename, no downloads or previews
+moflo -rename-only -local          # also rename files that are not liked models, looked up by checksum
+moflo -rename-only -local -guess   # and tag the ones Civitai does not know from their metadata
+moflo -tag folder -rename-only     # switch to loras/flux1_dev/x.safetensors style
+moflo -latest            # also fetch the newest version when you hold an older one
+moflo -checksum          # checksum every model file now (slow, once)
+moflo -ea                # only retry early access versions refused before
+moflo -ea -all           # retry those, and do everything a normal run does
 ```
 
 Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly at any point; checksums done so far are kept.
@@ -265,7 +269,7 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-models` | `~/ComfyUI/models` | ComfyUI models folder |
-| `-base` | `all` | Base models to handle (downloads, renames, previews), comma separated, as tags (`flux1_dev`) or Civitai names (`"Flux.1 D"`). `all` handles every base. |
+| `-base` | from the config | Base models to handle this run (downloads, renames, previews), comma separated, as tags (`flux1_dev`) or Civitai names (`"Flux.1 D"`); `all` handles every base. Without it, the config's choice applies. |
 | `-tag` | `front` | Where the base model tag goes in file names; see [File names](#file-names). |
 | `-previews` | `1` | Preview images to keep per model file (`0` for none) |
 | `-previews-only` | off | Only fetch missing previews for liked models already on disk |
@@ -280,32 +284,81 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | `-yes` | off | Go ahead without asking |
 | `-n` | off | Show the plan; change nothing |
 | `-max` | `1000` | Refuse to act on a likes list longer than this |
-| `-state` | `<models>/.civitai-likes.json` | State file |
+| `-state` | `<models>/.moflo.json` | State file |
 | `-token-file` | `~/.config/civitai/token` | File holding the API token |
 | `-api` | `https://civitai.com` | Civitai base URL |
-| `-config` | `~/.config/civitai-likes/config` | Config file with default flags |
-| `-print-config` | | Print the settings in effect, in config file form, and exit |
+| `-config` | `~/.config/moflo/config.json` | The [config file](#config-file) |
+| `-set-conf` | | Save the flags given on the command line into the config file as the new defaults (`-base` sets which base models are downloaded). `-n` is never saved. |
+| `-reconfig` | | List the base models in your likes again and ask which to download |
+| `-print-config` | | Print the config as it applies to this run, and exit |
 
 `-rename-only` cannot be combined with `-previews-only` or `-ea`, and `-previews-only` cannot be combined with `-ea`.
 
-A run with `-base` lists the other base models found in your likes with the tag to pass, and says per selected base model how many files are on disk and how many are to download. `civitai-likes -base all -n` prints every tag in your likes.
+Every run lists the other base models found in your likes that are not downloaded, and says per base model how many files are on disk and how many are to download.
 
 ### Config file
 
-Flags you always use can go in `~/.config/civitai-likes/config` (on macOS, `~/Library/Application Support/civitai-likes/config`), one `flag = value` per line, with `#` comments. A bare flag name means `true`. Flags given on the command line win. To start one with every flag and its help text:
+`~/.config/moflo/config.json` (on macOS, `~/Library/Application Support/moflo/config.json`) holds the default of every flag, which base models are downloaded, and per base model the liked models with what became of each. It is created on the first run.
 
-```sh
-mkdir -p ~/.config/civitai-likes
-civitai-likes -print-config > ~/.config/civitai-likes/config
+**First run.** The base models in your likes are listed by number; answer with the ones to download, `1 2 3` or `1,2,3` (ranges like `2-5`, `all` and `none` work too; Enter means all). The answer is saved; change it in the file, or run `-reconfig` to be asked again. With `-yes` on the first run nothing can be asked, so every base model is set to download.
+
+**New base models.** When a liked model brings a base model the file has no choice for, `newBaseModels` decides: `ask` (the default) lists them, marked new, with the others; `download` or `skip` decides without asking. A run with `-yes` cannot ask, so it leaves new ones off and says so.
+
+**Flags.** A flag on the command line applies to that run only. Add `-set-conf` to save the flags given into the file as new defaults: `moflo -set-conf -previews 3 -tag folder`. Add `-n` to save without downloading anything.
+
+The file looks like this (the `help` section, written by the tool, explains every setting):
+
+```json
+{
+  "newBaseModels": "ask",
+  "settings": {
+    "models": "/home/jetson/ComfyUI/models",
+    "tag": "front",
+    "previews": 1,
+    "latest": false,
+    "yes": false
+  },
+  "bases": {
+    "flux1_dev": {
+      "name": "Flux.1 D",
+      "download": true,
+      "previews": 3,
+      "latest": null,
+      "models": {
+        "10": { "name": "Amanita", "type": "LORA", "download": true, "status": "on disk",
+                "version": "v1-flux", "file": "loras/flux1_dev_Amanita.safetensors", "updated": "2026-10-16" },
+        "40": { "name": "Early Bird", "type": "LORA", "download": true,
+                "status": "held back: refused Oct 16 (403 ...); early access ends Jan 1 2099" }
+      }
+    },
+    "sdxl1": {
+      "name": "SDXL 1.0",
+      "download": true,
+      "previews": null,
+      "latest": null,
+      "models": {
+        "10": { "name": "Amanita", "type": "LORA", "download": false,
+                "status": "skipped: not downloaded: \"download\" is false for it in the config" }
+      }
+    },
+    "pony": { "name": "Pony", "download": false, "previews": null, "latest": null, "models": {
+        "10": { "name": "Amanita", "type": "LORA", "download": true, "status": "base model not downloaded" } } }
+  }
+}
 ```
 
-```ini
-# example
-models   = /mnt/ai/ComfyUI/models
-base     = flux1_dev,sdxl1
-tag      = folder
-previews = 3
-```
+| Part | Yours to set | Written by the tool |
+| --- | --- | --- |
+| `settings` | Every flag's default | Settings missing from the file, at their built-in default |
+| `newBaseModels` | `ask`, `download` or `skip` | |
+| `bases.<base>.download` | `true` / `false` (`null`: not chosen yet, asked about) | Your answer to the numbered list |
+| `bases.<base>.previews`, `.latest` | A number / `true` or `false` for this base only; `null` uses the setting. A `-previews` or `-latest` flag on the command line wins. | |
+| `bases.<base>.models.<id>.download` | `false` keeps this liked model from being downloaded for this base | `true` for a model met for the first time |
+| `bases.<base>.models.<id>` other fields | | Name, type, status, version, file, date of the last change |
+
+Models are keyed by their Civitai model id, and listed under every base model they have a version for, including base models you do not download, so you can switch one off before turning its base on. To get one LoRA for one base model only, set `"download": false` on it under the others. Upscalers and other models with no base model are under `none`. A model you unlike is kept and marked `no longer liked`.
+
+The tool only ever rewrites its own parts. If you edit the file while a run is going, your edits are kept; they take effect on the next run. A mistake in the file stops the run with its line and column. A config from civitai-likes (see above) is imported the first time and no longer read.
 
 ### File names
 
@@ -337,7 +390,7 @@ Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `
 
 ### State file
 
-`<models>/.civitai-likes.json` records each model file's size, date, checksum, Civitai version, and base model, plus the early access refusals. Model Preview Popup reads it to label base models. It is safe to delete; the next run rebuilds what it can, but checksums are lost and have to be redone.
+`<models>/.moflo.json` records each model file's size, date, checksum, Civitai version, and base model, plus the early access refusals. Model Preview Popup reads it to label base models. It is safe to delete; the next run rebuilds what it can, but checksums are lost and have to be redone.
 
 ## HTTP routes
 
@@ -359,7 +412,7 @@ Names are as ComfyUI lists them, relative to the model folder (for example `flux
 - **A LoRA shows no tags.** Read the note under its name: no metadata, no captions, or not a `.safetensors` file. Nothing can be done for those.
 - **LLM Prompt fails.** The error names the cause: a missing key (see the key table), a `base_url` whose host is not listed for the key (see the host table), a wrong `base_url`, or a server that did not answer within `timeout`.
 - **A model is missing from the Model Library.** Its base model may be unticked under **Base models** in the popup.
-- **civitai-likes says "Civitai sign-in failed".** The token is wrong or expired; make a new one.
+- **moFlo says "Civitai sign-in failed".** The token is wrong or expired; make a new one.
 
 ## License
 

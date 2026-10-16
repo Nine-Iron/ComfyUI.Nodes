@@ -5,12 +5,12 @@ preview images saved beside the model file:
 
     <name>.preview.<ext>      the main preview (what ComfyUI shows as the icon)
     <name>.<ext>              also accepted as the main preview
-    <name>.preview-2.<ext>    extras, as civitai-likes -previews N saves them
+    <name>.preview-2.<ext>    extras, as moflo -previews N saves them
     ...
 
 Click an extra in the popup to view it large. Beside the picture, a column
 shows what it was made with (prompt, negative, sampler settings, LoRAs), read
-from <name>.preview.json (civitai-likes saves these) or from metadata inside the
+from <name>.preview.json (moFlo saves these) or from metadata inside the
 image (A1111/Forge parameters, ComfyUI prompt graph). The popup also shows the
 model's base model, and its "Base models" button picks which base models are
 shown in the Model Library and in loader dropdowns. When a model has preview files
@@ -74,7 +74,7 @@ def preview_files(model_path):
 
 # ------------------------------------------------------- generation settings
 # What each preview picture was made with, from (first match wins):
-#   1. a sidecar <name>.preview.json / <name>.preview-N.json, which civitai-likes
+#   1. a sidecar <name>.preview.json / <name>.preview-N.json, which moFlo
 #      writes with the image's data from Civitai;
 #   2. metadata embedded in the image: A1111/Forge "parameters" text (PNG text
 #      chunk or EXIF UserComment) or a ComfyUI prompt graph (PNG "prompt" chunk,
@@ -569,7 +569,7 @@ def generation_info(image_path):
 
 # ------------------------------------------------------------- base models
 # Which base model each model file is for, worked out in this order:
-#   1. the civitai-likes state file (<models>/.civitai-likes.json)
+#   1. the moFlo state file (<models>/.moflo.json)
 #   2. a tag in the name: flux1_dev_x, x_flux1_dev, x.flux1_dev, or a flux1_dev/ folder
 #   3. the base model the file itself records (kohya / modelspec metadata)
 #   4. a guess from the tensor names in the file header
@@ -591,8 +591,10 @@ _base_cache = {}  # path -> (mtime, size, (tag, label, source))
 
 
 def _state_bases():
-    """{absolute path: (tag, label)} from the civitai-likes state file."""
-    path = os.path.join(folder_paths.models_dir, ".civitai-likes.json")
+    """{absolute path: (tag, label)} from the moFlo state file."""
+    path = os.path.join(folder_paths.models_dir, ".moflo.json")
+    if not os.path.exists(path):  # not yet moved over from moFlo's old name
+        path = os.path.join(folder_paths.models_dir, ".civitai-likes.json")
     try:
         mtime = os.path.getmtime(path)
     except OSError:

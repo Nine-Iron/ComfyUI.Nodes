@@ -8,7 +8,7 @@
 //    is dropped from its metadata, so the sidebar icon keeps showing yours.
 // 3. Beside the picture, a column shows what that picture was made with
 //    (prompt, negative, sampler settings, LoRAs) when it is known: from the
-//    .preview.json civitai-likes saves, or from metadata inside the image.
+//    .preview.json moFlo saves, or from metadata inside the image.
 // 4. The popup shows the model's base model in large type, and its "Base
 //    models" button picks which base models are listed in the Model Library and
 //    in loader dropdowns. The choice is saved in ComfyUI's user settings.
