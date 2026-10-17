@@ -217,7 +217,7 @@ The **Base models** button in the popup opens a list of every base model found, 
 
 A command-line tool that downloads the models you have liked on Civitai into your ComfyUI models folder, without ever fetching one you already have. It also saves preview images in the layout Model Preview Popup reads, can tag file names with their base model, and can identify model files you got elsewhere.
 
-moFlo was called civitai-likes. Its first run carries everything over: the config (`~/.config/civitai-likes/config.json`, or the older `config` file beside it; on macOS, under `~/Library/Application Support/civitai-likes/`) is imported into `~/.config/moflo/config.json`, and the state file `<models>/.civitai-likes.json` is moved to `<models>/.moflo.json`. Model Preview Popup reads either state file, so nothing breaks in between. The API token stays where it was (`CIVITAI_TOKEN` or `~/.config/civitai/token`).
+moFlo was called civitai-likes. Its first run carries everything over: the config (`~/.config/civitai-likes/config.json`, or the older `config` file beside it) is imported into `~/.config/moflo/config.json`, and the state file `<models>/.civitai-likes.json` is moved to `<models>/.moflo.json`. Model Preview Popup reads either state file, so nothing breaks in between. The API token stays where it was (`CIVITAI_TOKEN` or `~/.config/civitai/token`).
 
 ### Setup
 
@@ -264,7 +264,7 @@ moflo -ea                # only retry early access versions refused before
 moflo -ea -all           # retry those, and do everything a normal run does
 ```
 
-Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly at any point; checksums done so far are kept.
+Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly at any point; checksums done so far are kept. Only one run works on a models folder at a time: a second one stops and names the run that is going (a `-n` run goes ahead with a warning).
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -279,7 +279,7 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | `-local` | off | Also look up model files that are not liked models on Civitai by checksum, so they get tagged and previewed too |
 | `-guess` | off | Tag model files Civitai does not know from the base model their own metadata names |
 | `-latest` | off | Fetch the newest version even when an older one is on disk |
-| `-checksum` | off | Checksum every model file with none on record |
+| `-checksum` | off | Checksum every model file with none on record (files that could be a liked file, or a copy of another, are checksummed anyway) |
 | `-ea` | off | Retry early access versions refused before; with `-all`, also do a normal run |
 | `-yes` | off | Go ahead without asking |
 | `-n` | off | Show the plan; change nothing |
@@ -380,10 +380,11 @@ Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `
 
 - **Versions.** A liked model with versions for several base models gets one file per selected base model, the newest version for each.
 - **Placement.** Each Civitai model type goes to its ComfyUI folder: checkpoints, `loras` (LORA, LoCon, DoRA), `embeddings`, `vae`, `controlnet`, `upscale_models`, `hypernetworks`, `animatediff_models`.
-- **Duplicate checks.** Before downloading, each file is checked against the whole models tree, whatever folder it was filed under and whichever `-tag` form it has: first by name for every version, then by size and SHA-256 to catch a copy saved under another name. Only what is missing is downloaded, and nothing is ever overwritten. Files that share a name and size but can't be told apart without checksums are left alone and listed, never guessed.
+- **Duplicate checks.** Before downloading, each file is checked against the whole models tree, whatever folder it was filed under and whichever `-tag` form it has: first by name for every version, then by size and SHA-256 to catch a copy saved under another name. Only what is missing is downloaded, and nothing is ever overwritten. A file that could be a liked file under another name (the same size, or the same name for two liked files) is checksummed to settle it, once; the checksum is kept. Only when Civitai gives no checksum to compare with is a same-size file left alone and listed.
+- **Copies and leftovers.** The same file stored twice in one models folder (as two runs with different `-tag` leave behind, `loras/sdxl1/x` and `loras/sdxl1_x`, say) is found by checksum and cut down to one: the copy named the way `-tag` names files now is kept (else the one with the most previews, else the oldest), and its twin's previews and settings files move over when it lacks them. A partial download (`.part`) whose finished file is already there is removed. Both are listed in the plan with the space they free, and happen only when you say yes. A file a symbolic link points to is never removed or renamed, and copies in different folders (`loras` and `checkpoints`) are left alone.
 - **Previews.** Each model file gets the first still image from its Civitai page saved beside it as `<name>.preview.<ext>`, safe-for-work images first. With `-previews N`, extras are saved as `<name>.preview-2.<ext>` and so on; rename the one you want to `<name>.preview.<ext>` to make it the icon (rename its `.json` with it, or the settings stay with the old name). Files you already have get previews too, unless one is already there. Beside each preview goes `<name>.preview.json` (`.preview-N.json` for extras) with what Civitai records about how that picture was made, which Model Preview Popup shows; when the model listing carries none, the version's image gallery is checked. Previews saved before this existed get theirs with `-preview-info`: which Civitai image a picture is cannot be told from its name, so up to 16 of the model's images are downloaded again and matched byte for byte. Pictures that match none (your own, say) are counted and left alone.
 - **Other model files.** With `-local`, model files no liked model accounts for (in `checkpoints`, `loras`, `diffusion_models`, `unet`, `embeddings`, `controlnet`, `hypernetworks`, `vae`, `animatediff_models`) are checksummed once and looked up on Civitai, so they get tagged and previewed like the rest. With `-guess`, files Civitai does not know, such as your own trainings, are tagged from the base model their metadata names. Whatever is left without a base model is listed with the reason.
-- **Checksums.** The state file records what has been seen. Downloads are always checksummed to verify them; a download that fails is kept aside as `<name>.unverified`, hidden from ComfyUI, and listed on every run. Other files are checksummed only with `-checksum` or `-local`, each once.
+- **Checksums.** The state file records what has been seen. Downloads are always checksummed to verify them; a download that fails is kept aside as `<name>.unverified`, hidden from ComfyUI, and downloaded again on the next run; the bad copy goes once a good one checks out. Other files are checksummed when they might be a liked file or a copy (see above), with `-checksum`, or with `-local`, each once.
 - **Early access.** A version Civitai refuses to hand over (401, 402, or 403, typically early access you have not paid for) is recorded in the state file rather than reported as a failure. Later runs hold it back until its early access ends, or indefinitely if Civitai gives no end date, and list it under "Refused before, held back". Run with `-ea` once you have paid for it to try again right away; on its own, `-ea` retries only those versions, and `-ea -all` also does a full run. The plan marks versions that are currently in early access with their end date.
 - **Mangled names.** Files with a model extension in the middle of their name (`x.safetensors_1`), which ComfyUI does not list, are reported so you can fix them by hand.
 - **Safety margins.** Downloads keep 2 GB free on the disk, retry up to four times, and abort if no data arrives for two minutes.

@@ -667,6 +667,323 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 	return nil
 }
 
+// ------------------------------------------------------------- one run only
+
+// lockModels makes sure only one run works on a models folder at a time: two
+// runs planning the same downloads fetch everything twice. The lock is the
+// kernel's (flock), so it goes away by itself when a run ends or dies.
+func lockModels(root string) (*os.File, error) {
+	path := filepath.Join(root, ".moflo.lock")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		who, _ := os.ReadFile(path)
+		f.Close()
+		msg := strings.TrimSpace(string(who))
+		if msg == "" {
+			msg = "another run"
+		}
+		return nil, fmt.Errorf("moFlo is already running on %s (%s); let it finish, or stop it first", root, msg)
+	}
+	f.Truncate(0)
+	fmt.Fprintf(f, "pid %d, started %s", os.Getpid(), time.Now().Format("Jan 2 15:04"))
+	f.Sync()
+	return f, nil
+}
+
+// ----------------------------------------------------- copies and leftovers
+
+// copyGroup is one model file kept, and byte-identical copies of it to remove.
+type copyGroup struct {
+	keep localFile
+	drop []localFile
+}
+
+// untagged is a file name without any base model tag the tool may have put in
+// it, so the copies -tag front and -tag folder make of one file line up.
+func untagged(path string) string {
+	name := strings.ToLower(filepath.Base(path))
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for t := range knownTags {
+		switch {
+		case strings.HasPrefix(stem, t+"_"):
+			stem = strings.TrimPrefix(stem, t+"_")
+		case strings.HasSuffix(stem, "_"+t):
+			stem = strings.TrimSuffix(stem, "_"+t)
+		case strings.HasSuffix(stem, "."+t):
+			stem = strings.TrimSuffix(stem, "."+t)
+		}
+	}
+	return stem + ext
+}
+
+// topFolder is the models folder a file belongs to (loras, checkpoints, ...).
+func topFolder(idx *index, path string) string {
+	rel := idx.rel(path)
+	if i := strings.IndexAny(rel, `/\`); i > 0 {
+		return rel[:i]
+	}
+	return ""
+}
+
+// inTagForm reports whether a file is named the way -tag names files now.
+func inTagForm(path string) bool {
+	dir, stem := filepath.Base(filepath.Dir(path)), strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	for t := range knownTags {
+		tagged := false
+		switch tagMode {
+		case "folder":
+			tagged = strings.EqualFold(dir, t)
+		case "front":
+			tagged = strings.HasPrefix(stem, t+"_")
+		case "end":
+			tagged = strings.HasSuffix(stem, "_"+t)
+		case "dot":
+			tagged = strings.HasSuffix(stem, "."+t)
+		}
+		if tagged {
+			return true
+		}
+	}
+	return false
+}
+
+// findCopies finds model files stored more than once: the same bytes under the
+// same models folder, as two runs with different -tag leave behind. Files that
+// could be copies (same size, and the same name once tags are taken off, or a
+// checksum on record) are checksummed to make sure; links are never counted.
+func findCopies(ctx context.Context, idx *index, st *stateFile) ([]copyGroup, error) {
+	type key struct {
+		top  string
+		size int64
+	}
+	bySize := map[key][]localFile{}
+	for _, l := range idx.all {
+		if isModelFile(l.path) {
+			k := key{topFolder(idx, l.path), l.size}
+			bySize[k] = append(bySize[k], l)
+		}
+	}
+	var hashNow []localFile
+	var hashBytes int64
+	suspects := map[string]bool{}
+	for _, group := range bySize {
+		if len(group) < 2 {
+			continue
+		}
+		names := map[string]int{}
+		for _, l := range group {
+			names[untagged(l.path)]++
+		}
+		for _, l := range group {
+			if names[untagged(l.path)] > 1 || idx.shaByPath[l.path] != "" {
+				suspects[l.path] = true
+				if idx.shaByPath[l.path] == "" {
+					hashNow = append(hashNow, l)
+					hashBytes += l.size
+				}
+			}
+		}
+	}
+	if len(hashNow) > 0 {
+		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that look like copies of each other, %s...\n", len(hashNow), human(hashBytes))
+	}
+	for i, l := range hashNow {
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(hashNow), idx.rel(l.path), human(l.size))
+		sum, err := hashFile(ctx, l.path)
+		if err != nil {
+			if ctx.Err() != nil {
+				st.saveOrWarn()
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		idx.shaByPath[l.path] = sum
+		idx.byHash[sum] = append(idx.byHash[sum], l)
+		if e := st.Files[idx.rel(l.path)]; e != nil {
+			e.SHA256 = sum
+		}
+	}
+	st.saveOrWarn()
+
+	type hkey struct{ top, sha string }
+	byHash := map[hkey][]localFile{}
+	for _, l := range idx.all {
+		if sha := idx.shaByPath[l.path]; sha != "" && suspects[l.path] {
+			k := hkey{topFolder(idx, l.path), sha}
+			byHash[k] = append(byHash[k], l)
+		}
+	}
+	// Files that a symbolic link somewhere in the tree points to: never removed.
+	targets := linkTargets(idx)
+	linked := func(fi os.FileInfo) bool { return isLinkTarget(targets, fi) }
+	var out []copyGroup
+	for _, group := range byHash {
+		var real []localFile // links (symbolic or hard) are not copies
+		var infos []os.FileInfo
+		for _, l := range group {
+			li, err := os.Lstat(l.path)
+			if err != nil || li.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			same := false
+			for _, o := range infos {
+				if os.SameFile(o, li) {
+					same = true
+				}
+			}
+			if !same {
+				real = append(real, l)
+				infos = append(infos, li)
+			}
+		}
+		if len(real) < 2 {
+			continue
+		}
+		isLinked := map[string]bool{}
+		for i, l := range real {
+			isLinked[l.path] = linked(infos[i])
+		}
+		// Keep one a link points to, then the one named the way -tag names
+		// files now, then the one with the most previews and info files, then
+		// the oldest. Every copy a link points to stays.
+		sort.SliceStable(real, func(i, j int) bool {
+			a, b := real[i], real[j]
+			if la, lb := isLinked[a.path], isLinked[b.path]; la != lb {
+				return la
+			}
+			if ta, tb := inTagForm(a.path), inTagForm(b.path); ta != tb {
+				return ta
+			}
+			if na, nb := len(sidecars(a.path)), len(sidecars(b.path)); na != nb {
+				return na > nb
+			}
+			if a.mtime != b.mtime {
+				return a.mtime < b.mtime
+			}
+			return a.path < b.path
+		})
+		g := copyGroup{keep: real[0]}
+		for _, l := range real[1:] {
+			if !isLinked[l.path] {
+				g.drop = append(g.drop, l)
+			}
+		}
+		if len(g.drop) > 0 {
+			out = append(out, g)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].keep.path < out[j].keep.path })
+	return out, nil
+}
+
+// linkTargets lists the files symbolic links in the tree point to.
+func linkTargets(idx *index) []os.FileInfo {
+	var out []os.FileInfo
+	for _, l := range idx.all {
+		if li, err := os.Lstat(l.path); err == nil && li.Mode()&os.ModeSymlink != 0 {
+			if ti, err := os.Stat(l.path); err == nil {
+				out = append(out, ti)
+			}
+		}
+	}
+	return out
+}
+
+func isLinkTarget(targets []os.FileInfo, fi os.FileInfo) bool {
+	for _, t := range targets {
+		if os.SameFile(t, fi) {
+			return true
+		}
+	}
+	return false
+}
+
+// staleParts lists partial downloads whose finished file is already there:
+// left over when another run finished the same file first.
+func staleParts(idx *index) []localFile {
+	have := map[string]bool{}
+	for _, l := range idx.all {
+		have[l.path] = true
+	}
+	var out []localFile
+	for _, l := range idx.all {
+		if strings.HasSuffix(l.path, ".part") && have[strings.TrimSuffix(l.path, ".part")] {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// drop takes files out of the index, so the plan works with what stays.
+func (idx *index) drop(gone map[string]bool) {
+	if len(gone) == 0 {
+		return
+	}
+	keep := func(ls []localFile) []localFile {
+		out := ls[:0:0]
+		for _, l := range ls {
+			if !gone[l.path] {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+	idx.all = keep(idx.all)
+	for k, ls := range idx.byName {
+		if idx.byName[k] = keep(ls); len(idx.byName[k]) == 0 {
+			delete(idx.byName, k)
+		}
+	}
+	for k, ls := range idx.byHash {
+		if idx.byHash[k] = keep(ls); len(idx.byHash[k]) == 0 {
+			delete(idx.byHash, k)
+		}
+	}
+	for p := range gone {
+		delete(idx.shaByPath, p)
+	}
+}
+
+// removeCopy deletes one copy of a model file. Its previews and info files
+// move to the copy kept when that has none of the same kind, else they go too.
+func removeCopy(idx *index, st *stateFile, drop, keep string) (freed int64, err error) {
+	oldBase := strings.TrimSuffix(drop, filepath.Ext(drop))
+	newBase := strings.TrimSuffix(keep, filepath.Ext(keep))
+	for _, sc := range sidecars(drop) {
+		dst := newBase + strings.TrimPrefix(sc, oldBase)
+		if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
+			if os.Rename(sc, dst) == nil {
+				continue
+			}
+		}
+		if info, err := os.Stat(sc); err == nil {
+			freed += info.Size()
+		}
+		os.Remove(sc)
+	}
+	info, err := os.Stat(drop)
+	if err != nil {
+		return freed, err
+	}
+	if err := os.Remove(drop); err != nil {
+		return freed, err
+	}
+	if e := st.Files[idx.rel(drop)]; e != nil {
+		if k := st.Files[idx.rel(keep)]; k != nil && k.Base == "" {
+			k.Base, k.BaseName, k.Model, k.VersionID = e.Base, e.BaseName, e.Model, e.VersionID
+		}
+		delete(st.Files, idx.rel(drop))
+	}
+	if dir := filepath.Dir(drop); isTagDir(dir) {
+		os.Remove(dir) // a tag folder left empty; fails harmlessly otherwise
+	}
+	return freed + info.Size(), nil
+}
+
 // --------------------------------------------------------------- previews
 
 type apiImage struct {
@@ -1351,6 +1668,8 @@ type planOptions struct {
 	blocked      map[string]bool // modelKey -> "download": false for that base
 	basePreviews map[string]int  // base tag -> previews for it
 	baseLatest   map[string]bool // base tag -> latest for it
+	removing     map[string]bool // copies and leftovers this run removes first
+	links        []os.FileInfo   // files symbolic links point to: never renamed
 }
 
 // previewsFor is how many previews a file of this base model keeps.
@@ -1472,11 +1791,12 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			}
 			return it
 		}
-		// 3. An earlier download of it that failed its checksum.
+		// 3. An earlier download of it that failed its checksum: downloaded
+		//    again below (unless a good copy turns up), and the bad one goes
+		//    once the new one checks out.
+		retry := ""
 		if ls := idx.byName[strings.ToLower(target.tagged)+".unverified"]; len(ls) > 0 {
-			it.status = stAlone
-			it.note = idx.rel(ls[0].path) + " is an earlier download that failed its checksum; delete it to retry"
-			return it
+			retry = idx.rel(ls[0].path)
 		}
 		// 4. A copy under some other name, by the checksums on record.
 		for i, cd := range check {
@@ -1524,6 +1844,9 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			it.dest = filepath.Join(idx.root, dir, tagSubdir(target.tag), target.tagged)
 			if ls := idx.byName[strings.ToLower(target.file.Name)]; len(ls) > 0 && target.tagged != target.file.Name {
 				it.note = fmt.Sprintf("%s has Civitai's name for it but is a different file (another base model's version, or another size)", idx.rel(ls[0].path))
+			}
+			if retry != "" {
+				it.note = joinNote(it.note, retry+" failed its checksum before; downloading it again")
 			}
 		}
 		return it
@@ -1619,11 +1942,34 @@ func checksumAmbiguous(ctx context.Context, idx *index, st *stateFile, models []
 			}
 		}
 	}
+	// Also any model file exactly the size of a liked file Civitai has a
+	// checksum for: it may be that file under another name, and only its
+	// checksum tells. Each is checksummed once; the result is kept.
+	var sizes []int64
+	for _, m := range models {
+		for _, v := range m.ModelVersions {
+			if f, ok := modelFile(v); ok && f.sha256() != "" && f.bytes() > 0 {
+				sizes = append(sizes, f.bytes())
+			}
+		}
+	}
 	var todo []localFile
+	var todoBytes int64
 	unsure := map[string]bool{}
 	for _, l := range idx.all {
-		if len(claims[l.path]) > 1 && idx.shaByPath[l.path] == "" {
+		if idx.shaByPath[l.path] != "" || !isModelFile(l.path) {
+			continue
+		}
+		sameSize := false
+		for _, s := range sizes {
+			if sizeExact(l.size, s) {
+				sameSize = true
+				break
+			}
+		}
+		if len(claims[l.path]) > 1 || sameSize {
 			todo = append(todo, l)
+			todoBytes += l.size
 			unsure[l.path] = true
 		}
 	}
@@ -1631,7 +1977,7 @@ func checksumAmbiguous(ctx context.Context, idx *index, st *stateFile, models []
 		return unsure, nil
 	}
 	if len(todo) > 0 {
-		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that match more than one liked file by name and size...\n", len(todo))
+		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that may be a liked file under another name, %s (once each)...\n", len(todo), human(todoBytes))
 	}
 	for i, l := range todo {
 		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(todo), idx.rel(l.path), human(l.size))
@@ -1675,8 +2021,13 @@ func settle(res *planResult, st *stateFile, idx *index, opt planOptions, from in
 			continue
 		}
 		to := it.rename
+		if fi, err := os.Stat(it.found); err == nil && isLinkTarget(opt.links, fi) {
+			it.note += "; not renamed, a link points to it"
+			it.rename = ""
+			continue
+		}
 		_, err := os.Lstat(to)
-		if err == nil || srcTaken[it.found] || dstTaken[strings.ToLower(to)] {
+		if (err == nil && !opt.removing[to]) || srcTaken[it.found] || dstTaken[strings.ToLower(to)] {
 			it.note += fmt.Sprintf("; cannot be renamed, %s is taken", idx.rel(it.rename))
 			it.rename = ""
 			continue
@@ -2203,9 +2554,14 @@ func (c *client) fetch(ctx context.Context, it item, tty bool) (string, error) {
 		}
 	}
 	if _, err := os.Lstat(it.dest); err == nil {
-		return "", fmt.Errorf("%s appeared while downloading; the new copy stays as %s", it.dest, filepath.Base(part))
+		os.Remove(part) // someone else put it there meanwhile; this copy is not needed
+		return "", fmt.Errorf("%s appeared while downloading (another run?); kept that one", it.dest)
 	}
-	return got, os.Rename(part, it.dest)
+	if err := os.Rename(part, it.dest); err != nil {
+		return "", err
+	}
+	os.Remove(it.dest + ".unverified") // an earlier bad download of it, now replaced
+	return got, nil
 }
 
 // mismatchDetail says what came instead of the file asked for: the name
@@ -3089,8 +3445,8 @@ func run() int {
 		"early access to end (for ones you have since paid for); on its own, only those")
 	eaAll := flag.Bool("all", false, "with -ea: also do everything a normal run does")
 	checksum := flag.Bool("checksum", false, "checksum every model file that has no checksum on record (slow, once per file).\n"+
-		"Otherwise only downloads are checksummed (and -local files); checksums catch copies\n"+
-		"under other names and tell apart files that share a name and size")
+		"Without it, downloads, -local files, and files that could be a liked file or a copy\n"+
+		"of another are checksummed; that is enough to catch copies and tell files apart")
 	local := flag.Bool("local", false, "also look up model files that are not liked models on Civitai by checksum, so they\n"+
 		"get tagged and previewed too (the first run checksums them all, which is slow)")
 	guess := flag.Bool("guess", false, "tag model files Civitai does not know (your own trainings, files from elsewhere)\n"+
@@ -3235,6 +3591,15 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	if lock, err := lockModels(root); err != nil {
+		if !*dryRun {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Fprintln(os.Stderr, "note:", err, "(a dry run goes ahead; its plan may be out of date)")
+	} else {
+		defer lock.Close()
+	}
 	statePath := *stateOpt
 	if statePath == "" {
 		statePath = filepath.Join(root, ".moflo.json")
@@ -3350,7 +3715,30 @@ func run() int {
 			}
 		}
 	}
-	if opt.unsure, err = checksumAmbiguous(ctx, idx, st, models, *checksum); err != nil {
+	// Copies of one file (two runs with different -tag, say) and partial
+	// downloads someone else finished: cleaned up, and left out of the plan.
+	copies, err := findCopies(ctx, idx, st)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
+		return 130
+	}
+	stale := staleParts(idx)
+	var cleanBytes int64
+	gone := map[string]bool{}
+	for _, g := range copies {
+		for _, d := range g.drop {
+			gone[d.path] = true
+			cleanBytes += d.size
+		}
+	}
+	for _, p := range stale {
+		gone[p.path] = true
+		cleanBytes += p.size
+	}
+	idx.drop(gone)
+	cleanN := len(gone)
+	opt.removing, opt.links = gone, linkTargets(idx)
+	if opt.unsure, err = checksumAmbiguous(ctx, idx, st, models, true); err != nil {
 		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
 		return 130
 	}
@@ -3596,7 +3984,7 @@ func run() int {
 		for _, u := range unverified {
 			fmt.Printf("  %s\n", u)
 		}
-		fmt.Println("  Delete one and run again to re-download it; the error then says what Civitai sent.")
+		fmt.Println("  Each one of a liked model is downloaded again (see above); one that verifies replaces it.")
 	}
 	if odd := oddNames(idx); len(odd) > 0 {
 		fmt.Printf("\nMangled names, hidden from ComfyUI (the extension is not at the end; fix these by hand):\n")
@@ -3684,6 +4072,25 @@ func run() int {
 		fmt.Println("\nEvery preview picture of a liked model you have already has its generation settings file.")
 	}
 
+	if len(copies) > 0 {
+		fmt.Printf("\nThe same file stored more than once (checksums match); the first of each is kept, the rest removed:\n")
+		for _, g := range copies {
+			fmt.Printf("  keep    %s\n", idx.rel(g.keep.path))
+			for _, d := range g.drop {
+				fmt.Printf("  remove  %s  (%s)\n", idx.rel(d.path), human(d.size))
+			}
+		}
+	}
+	if len(stale) > 0 {
+		fmt.Printf("\nPartial downloads whose finished file is already there, to remove (%d):\n", len(stale))
+		for _, p := range stale {
+			fmt.Printf("  %s  (%s)\n", idx.rel(p.path), human(p.size))
+		}
+	}
+	if cleanN > 0 {
+		fmt.Printf("  Frees %s.\n", human(cleanBytes))
+	}
+
 	var need int64
 	for _, it := range items {
 		if it.status == stGet {
@@ -3708,7 +4115,7 @@ func run() int {
 		}
 		return line
 	})
-	if count == 0 && renames == 0 && thumbsHave == 0 && infoPics == 0 {
+	if count == 0 && renames == 0 && thumbsHave == 0 && infoPics == 0 && cleanN == 0 {
 		if *renameOnly {
 			fmt.Printf("\nEvery model file it knows the base of is already named for -tag %s.\n", tagMode)
 			return 0
@@ -3749,6 +4156,9 @@ func run() int {
 		}
 		if infoPics > 0 {
 			parts = append(parts, fmt.Sprintf("look up settings for %d preview(s)", infoPics))
+		}
+		if cleanN > 0 {
+			parts = append(parts, fmt.Sprintf("remove %d copie(s) and leftover(s) (%s)", cleanN, human(cleanBytes)))
 		}
 		question := strings.Join(parts, ", ")
 		fmt.Printf("%s%s? [y/N] ", strings.ToUpper(question[:1]), question[1:])
@@ -3791,6 +4201,32 @@ func run() int {
 		}
 		st.saveOrWarn()
 		return saved
+	}
+
+	if cleanN > 0 {
+		var freed int64
+		removed := 0
+		for _, g := range copies {
+			for _, d := range g.drop {
+				n, err := removeCopy(idx, st, d.path, g.keep.path)
+				freed += n
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("remove %s: %v", idx.rel(d.path), err))
+					continue
+				}
+				removed++
+			}
+		}
+		for _, p := range stale {
+			if err := os.Remove(p.path); err != nil {
+				failed = append(failed, fmt.Sprintf("remove %s: %v", idx.rel(p.path), err))
+				continue
+			}
+			freed += p.size
+			removed++
+		}
+		st.saveOrWarn()
+		fmt.Printf("\nRemoved %d copie(s) and leftover(s), freed %s.\n", removed, human(freed))
 	}
 
 	infoMatched, infoMissing := 0, 0
@@ -3846,6 +4282,15 @@ func run() int {
 				}
 				if err := os.Rename(sc[0], sc[1]); err != nil {
 					failed = append(failed, fmt.Sprintf("rename %s: %v", idx.rel(sc[0]), err))
+				}
+			}
+			// Previews that arrived after the plan (from a removed copy) go too.
+			oldBase := strings.TrimSuffix(it.found, filepath.Ext(it.found))
+			newBase := strings.TrimSuffix(to, filepath.Ext(to))
+			for _, sc := range sidecars(it.found) {
+				dst := newBase + strings.TrimPrefix(sc, oldBase)
+				if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
+					os.Rename(sc, dst)
 				}
 			}
 			// After the previews have moved out too: a tag folder left empty goes.

@@ -5,9 +5,9 @@ __pycache__/
 # API keys for Prompt Generator (keys.example.json is the template)
 keys.json
 
-# Locally built civitai-likes binary (the prebuilt .linux.arm64 one is tracked)
-CivitAI.Model.Plus.Preview.Picker/civitai-likes
-CivitAI.Model.Plus.Preview.Picker/civitai-likes.exe
+# Locally built moflo binary (the prebuilt .linux.arm64 one is tracked)
+moFlo/moflo
+moFlo/moflo.exe
 
 # Personal Claude Code settings
 .claude/settings.local.json
