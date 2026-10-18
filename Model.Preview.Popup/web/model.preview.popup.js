@@ -35,6 +35,7 @@ const STYLE = `
 .mpp-btn:hover { border-color: var(--p-primary-color, #3b82f6); }
 .mpp-title { font-weight: 600; font-size: 13px; margin-bottom: 2px; overflow-wrap: anywhere; }
 .mpp-file { color: var(--descrip-text, #999); font-size: 11px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.mpp-title .mpp-ver { font-weight: 400; font-size: 11px; color: var(--descrip-text, #999); margin-left: 6px; }
 .mpp-popup.has-info { width: 720px; }
 .mpp-body { display: flex; gap: 10px; align-items: flex-start; }
 .mpp-body > .mpp-stage { flex: 0 0 378px; max-width: 100%; }
@@ -102,9 +103,10 @@ function previewsFor(folder, filename) {
   const promise = api.fetchApi(`/Model.Preview.Popup/list?${q}`)
     .then((r) => (r.ok ? r.json() : {}))
     .then((d) => ({ images: Array.isArray(d.images) ? d.images : [], base: d.base || "unknown",
+                    title: typeof d.title === "string" ? d.title : "", version: typeof d.version === "string" ? d.version : "",
                     info: d.info && typeof d.info === "object" ? d.info : {},
                     baseLabel: d.baseLabel || "Unknown", baseSource: d.baseSource || "none" }))
-    .catch(() => { listCache.delete(key); return { images: [], info: {}, base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
+    .catch(() => { listCache.delete(key); return { images: [], info: {}, title: "", version: "", base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
   listCache.set(key, { at: Date.now(), promise });
   return promise;
 }
@@ -113,20 +115,40 @@ function imageUrl(folder, filename, name) {
   return api.apiURL(`/Model.Preview.Popup/image?${new URLSearchParams({ folder, filename, name })}`);
 }
 
-// --- keep the sidebar icon on the preview file -----------------------------
-// The Model Library prefers a thumbnail embedded in the model file over the
-// preview beside it. Drop the embedded one whenever a preview file exists.
+// --- the sidebar's icon and name ---------------------------------------------
+// The Model Library labels a model with the title its trainer wrote into the
+// file (often "ComfyUI1" or "last") and prefers a thumbnail embedded in it over
+// the preview beside it. Both are replaced here, on the metadata it reads:
+// the title by the model's name on Civitai as moFlo recorded it (or the file
+// name when the embedded title says nothing), the thumbnail dropped whenever
+// a preview file exists. The trainer's title is kept as mpp.trainerTitle.
+const TITLE_KEYS = ["modelspec.title", "title"];
+
+function genericTitle(t) {
+  const low = String(t || "").trim().toLowerCase();
+  if (!low || low.startsWith("comfyui") || /[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}/.test(low)) return true;
+  const words = low.split(/[\s_.\-]+/).filter((w) => w && !/^(v|e|ep|epoch|step|r)?\d+[a-z]?$/.test(w)
+    && !["sd", "sd15", "sdxl", "xl", "flux", "flux1", "pony", "il", "illu", "illustrious", "zit", "lora", "last", "final", "test", "model"].includes(w));
+  return words.join("").replace(/[^a-z]/g, "").length <= 5;
+}
+
 function patchMetadata() {
   const original = api.viewMetadata?.bind(api);
   if (!original || api.viewMetadata.__mpp) return;
   const patched = async (folder, filename, ...rest) => {
     const meta = await original(folder, filename, ...rest);
-    if (!meta || typeof meta !== "object") return meta;
-    if (!THUMB_KEYS.some((k) => k in meta)) return meta;
-    const { images } = await previewsFor(folder, filename);
-    if (!images.length) return meta;
-    const copy = { ...meta };
-    for (const k of THUMB_KEYS) delete copy[k];
+    const info = await previewsFor(folder, filename);
+    const copy = meta && typeof meta === "object" ? { ...meta } : {};
+    const had = TITLE_KEYS.map((k) => copy[k]).find((v) => typeof v === "string" && v.trim()) || "";
+    let title = info.title || "";
+    if (!title && had && genericTitle(had)) title = filename.split("/").pop().replace(/\.[^.]+$/, "");
+    if (title && title !== had) {
+      if (had) copy["mpp.trainerTitle"] = had;
+      copy["modelspec.title"] = title;
+      delete copy.title;
+    }
+    if (info.images.length) for (const k of THUMB_KEYS) delete copy[k];
+    if (!meta && !Object.keys(copy).length) return meta;
     return copy;
   };
   patched.__mpp = true;
@@ -474,8 +496,10 @@ async function show(leaf, folder, filename) {
   else baseEl.removeAttribute("title");
 
   const base = filename.split("/").pop();
-  titleEl.textContent = text(meta, "modelspec.title", "title") || base.replace(/\.[^.]+$/, "");
-  fileEl.textContent = `${folder}/${filename}`;
+  titleEl.replaceChildren(text(meta, "modelspec.title", "title") || base.replace(/\.[^.]+$/, ""));
+  if (info.version) titleEl.append(Object.assign(document.createElement("small"), { className: "mpp-ver", textContent: info.version }));
+  const trainer = text(meta, "mpp.trainerTitle");
+  fileEl.textContent = `${folder}/${filename}` + (trainer ? `  ·  trainer's title: ${trainer}` : "");
 
   // Thumbnail strip on top: one slot per picture, filled as each arrives.
   let current = 0;

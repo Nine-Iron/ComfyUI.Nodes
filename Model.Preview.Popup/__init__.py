@@ -586,7 +586,7 @@ LABELS = {
     "unknown": "Unknown",
 }
 
-_state_cache = {"mtime": None, "map": {}}
+_state_cache = {"mtime": None, "map": {}, "titles": {}}
 _base_cache = {}  # path -> (mtime, size, (tag, label, source))
 
 
@@ -600,18 +600,29 @@ def _state_bases():
     except OSError:
         return {}
     if _state_cache["mtime"] != mtime:
-        mapping = {}
+        mapping, titles = {}, {}
         try:
             with open(path, encoding="utf-8") as f:
                 files = json.load(f).get("files", {})
             for rel, e in files.items():
-                if isinstance(e, dict) and e.get("base"):
-                    full = os.path.normpath(os.path.join(folder_paths.models_dir, rel))
+                if not isinstance(e, dict):
+                    continue
+                full = os.path.normpath(os.path.join(folder_paths.models_dir, rel))
+                if e.get("base"):
                     mapping[full] = (e["base"], e.get("baseName") or "")
+                if e.get("title"):
+                    titles[full] = (str(e["title"]), str(e.get("version") or ""))
         except (OSError, ValueError, AttributeError):
             pass
-        _state_cache.update(mtime=mtime, map=mapping)
+        _state_cache.update(mtime=mtime, map=mapping, titles=titles)
     return _state_cache["map"]
+
+
+def civitai_title(path):
+    """(title, version) moFlo recorded for a model file: Civitai's model name
+    without the base model list at its end, and the version name. ("", "") if none."""
+    _state_bases()
+    return _state_cache.get("titles", {}).get(os.path.normpath(path), ("", ""))
 
 
 def _known_tags():
@@ -737,7 +748,8 @@ try:
             gi = generation_info(os.path.join(directory, name))
             if gi:
                 info[name] = gi
-        return web.json_response({"found": True, "images": images, "info": info,
+        title, version = civitai_title(path)
+        return web.json_response({"found": True, "images": images, "info": info, "title": title, "version": version,
                                   "base": tag, "baseLabel": label, "baseSource": source})
 
     @routes.get("/Model.Preview.Popup/bases")

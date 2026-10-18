@@ -97,7 +97,7 @@ import (
 )
 
 const (
-	version       = "2026.10.18-1" // bumped with every build handed out
+	version       = "2026.10.18-3" // bumped with every build handed out
 	userAgent     = "moflo/" + version
 	sizeSlack     = 1024             // bytes; the API reports sizes in KB
 	stallTimeout  = 2 * time.Minute  // abort a download that stops sending data
@@ -522,19 +522,25 @@ type fileState struct {
 	Base     string   `json:"base,omitempty"`     // base model tag, e.g. flux1_dev
 	BaseName string   `json:"baseName,omitempty"` // what Civitai calls it, e.g. "Flux.1 D"
 	Model    string   `json:"model,omitempty"`    // Civitai model name
+	Title    string   `json:"title,omitempty"`    // the model name without the base model list at its end (shown in ComfyUI)
+	Version  string   `json:"version,omitempty"`  // Civitai version name
 	// What -local learned about a file no liked model accounts for.
 	ModelType    string `json:"modelType,omitempty"`
+	VersionName  string `json:"versionName,omitempty"`
 	VersionID    int64  `json:"versionId,omitempty"`
 	NotOnCivitai bool   `json:"notOnCivitai,omitempty"`
 }
 
 // setBase notes which base model a file is for (read by the preview popup).
 func (s *stateFile) setBase(idx *index, path string, it item, baseName string) {
-	if it.tag == "" {
-		return
-	}
 	e := s.Files[idx.rel(path)]
 	if e == nil {
+		return
+	}
+	if it.model.Name != "" { // the name ComfyUI shows for it (read by the preview popup)
+		e.Title, e.Version = cleanTitle(it.model.Name), it.ver.Name
+	}
+	if it.tag == "" {
 		return
 	}
 	e.Base, e.BaseName, e.Model = it.tag, baseName, it.model.Name
@@ -629,6 +635,7 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 			ne := &fileState{Size: l.size, MTime: l.mtime}
 			if e != nil { // a changed file keeps what is known about it, not its checksum
 				ne.Previews, ne.Base, ne.BaseName, ne.Model = e.Previews, e.Base, e.BaseName, e.Model
+				ne.Title, ne.Version = e.Title, e.Version
 			}
 			e = ne
 			st.Files[rel] = e
@@ -1516,28 +1523,144 @@ var genericStems = map[string]bool{"comfyui": true, "lora": true, "loras": true,
 
 var hexRun = regexp.MustCompile(`(?i)[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}`)
 
-// genericName reports whether a file name tells nothing about the model:
-// what a trainer or ComfyUI saves by default, a UUID, or just a number.
+// baseWords are base model names as they turn up in file names; a name made
+// of nothing else (sdxl, flux1, pony_v2) says which base, not which model.
+var baseWords = map[string]bool{"sd": true, "sd1": true, "sd15": true, "sd21": true, "sd2": true, "sd3": true,
+	"sd35": true, "sdxl": true, "xl": true, "flux": true, "flux1": true, "flux2": true, "fluxdev": true, "dev": true,
+	"schnell": true, "pony": true, "illustrious": true, "illu": true, "ill": true, "il": true, "noob": true,
+	"noobai": true, "zit": true, "zib": true, "zimage": true, "turbo": true, "qwen": true, "krea": true, "chroma": true,
+	"wan": true, "ltx": true, "hidream": true, "lora": true, "locon": true, "lycoris": true, "dora": true}
+
+var versionLike = regexp.MustCompile(`^(v|e|ep|epoch|step|steps|r|rank|s)?\d+([._]\d+)*[a-z]?$`)
+
+// genericName reports whether a file name tells nothing about the model: what
+// a trainer or ComfyUI saves by default, a UUID, a number, a base model's name,
+// or what is left once counters, versions and base model words are taken off
+// is five letters or fewer (tst_01, kids4, sdxl, last).
 func genericName(name string) bool {
 	stem := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
-	if hexRun.MatchString(stem) {
+	if hexRun.MatchString(stem) || strings.HasPrefix(stem, "comfyui") {
 		return true
 	}
-	// Drop counters and separators at the end: ComfyUI_00001_, lora-000010, last 2.
 	core := strings.TrimRight(stem, "0123456789_-. ")
-	if strings.HasPrefix(core, "comfyui") {
-		return true
-	}
 	if genericStems[strings.ReplaceAll(core, " ", "_")] {
 		return true
 	}
-	letters := 0
-	for _, r := range core {
-		if unicode.IsLetter(r) {
-			letters++
+	weight := 0
+	for _, tok := range strings.FieldsFunc(stem, func(r rune) bool { return r == '_' || r == '-' || r == '.' || r == ' ' }) {
+		if baseWords[tok] || knownTags[tok] || versionLike.MatchString(tok) {
+			continue
+		}
+		for _, r := range tok {
+			switch {
+			case r < 128 && unicode.IsLetter(r):
+				weight++
+			case unicode.IsLetter(r):
+				weight += 3 // one CJK character says about as much as a short word
+			}
 		}
 	}
-	return letters < 2
+	return weight <= 5
+}
+
+// ------------------------------------------------------------- display titles
+
+// titleBases are the base model names authors tack onto model titles:
+// "Crystals [FLUX+SDXL+PONY+1.5]", "Style XL + F1D + Illu + Pony + zit + zib".
+var titleBases = map[string]bool{"flux": true, "fl": true, "f1d": true, "f1": true, "f.1": true, "flux1": true,
+	"flux.1": true, "flux.1d": true, "fluxdev": true, "dev": true, "schnell": true, "klein": true, "kontext": true,
+	"9b": true, "4b": true, "krea": true, "krea2": true, "sdxl": true, "xl": true, "sd": true, "sd1": true,
+	"sd1.5": true, "sd15": true, "1.5": true, "sd2": true, "sd2.1": true, "sd3": true, "sd3.5": true, "sd3.5l": true,
+	"sd35": true, "pony": true, "pd": true, "ponyxl": true, "il": true, "ill": true, "illu": true, "illustrious": true,
+	"noob": true, "noobai": true, "zit": true, "zib": true, "zimage": true, "z-image": true, "turbo": true,
+	"qwen": true, "chroma": true, "anima": true, "wan": true, "hunyuan": true, "ltx": true, "hidream": true,
+	"lumina": true, "auraflow": true, "base": true, "and": true}
+
+// titleFillers may sit in such a list without making it anything else.
+var titleFillers = map[string]bool{"lora": true, "loha": true, "locon": true, "lycoris": true, "dora": true,
+	"for": true, "z": true, "image": true}
+
+var titleVersion = regexp.MustCompile(`(?i)^v?\d+(\.\d+)*[a-z]?$`)
+
+// allBases reports whether text is nothing but base model names, versions and
+// joiners, and how many base names it holds.
+func allBases(text string) (bool, int) {
+	n := 0
+	for _, tok := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune("+,/&|_-", r)
+	}) {
+		tok = strings.Trim(tok, ".")
+		switch {
+		case tok == "" || titleFillers[tok]:
+		case titleBases[tok]:
+			n++
+		case titleVersion.MatchString(tok):
+		default:
+			return false, n
+		}
+	}
+	return true, n
+}
+
+// cleanTitle is a model's name without the base model list its author put at
+// the end: "1950's (Technicolor) style XL + F1D + Illu + Pony + zit + zib"
+// becomes "1950's (Technicolor) style". A single base word that may belong to
+// the name ("Juggernaut XL") stays; a bracketed or joined list goes.
+func cleanTitle(name string) string {
+	trimEnd := func(s string) string {
+		return strings.TrimRightFunc(s, func(r rune) bool {
+			return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == ')' || r == ']' || r == '\'' || r == '!' || r == '?')
+		})
+	}
+	s := trimEnd(strings.TrimSpace(name))
+	for {
+		before := s
+		// A bracketed list at the end: [FLUX+SDXL+PONY+1.5], (SDXL/Pony), (+SDXL).
+		if strings.HasSuffix(s, "]") || strings.HasSuffix(s, ")") {
+			open := strings.LastIndexAny(s, "[(")
+			if open > 0 {
+				if ok, n := allBases(s[open+1 : len(s)-1]); ok && n > 0 {
+					s = trimEnd(s[:open])
+				}
+			}
+		}
+		// A list after a separator: "Painted World | Pony, SDXL, Flux".
+		for _, sep := range []string{" | ", "|", " - ", " – ", " — ", " / "} {
+			if i := strings.LastIndex(s, sep); i > 0 {
+				if ok, n := allBases(s[i+len(sep):]); ok && n > 0 {
+					s = trimEnd(s[:i])
+					break
+				}
+			}
+		}
+		// A run of base names at the end joined by + , / or two or more of them:
+		// "Style XL + F1D + Illu + Pony + zit". One bare "XL" stays.
+		words := strings.Fields(s)
+		cut := len(words)
+		for cut > 0 {
+			if ok, _ := allBases(words[cut-1]); !ok {
+				break
+			}
+			cut--
+		}
+		for cut < len(words) && titleVersion.MatchString(words[cut]) && !titleBases[strings.ToLower(words[cut])] {
+			cut++ // a number right after the name is part of it: "Paradox 3 SD XL 1.0"
+		}
+		if cut > 0 && cut < len(words) {
+			tail := strings.Join(words[cut:], " ")
+			_, n := allBases(tail)
+			if n >= 2 || strings.ContainsAny(tail, "+,/") {
+				s = trimEnd(strings.Join(words[:cut], " "))
+			}
+		}
+		if s == before || s == "" {
+			break
+		}
+	}
+	if s == "" {
+		return strings.TrimSpace(name)
+	}
+	return s
 }
 
 // cleanName turns a model name and version into a file name: letters (any
@@ -1614,11 +1737,42 @@ func saveName(m apiModel, v apiVersion, f apiFile, shared map[string]int) (strin
 			return f.Name, ""
 		}
 	}
-	built := cleanName(m.Name, v.Name)
+	built := modelFileName(m.Name, v.Name)
 	if built == "" {
 		return f.Name, ""
 	}
 	return built + strings.ToLower(filepath.Ext(f.Name)), why
+}
+
+// modelFileName builds a file name (no extension) from a model's name and
+// version, leaving the version out when the model name already says it.
+func modelFileName(model, version string) string {
+	model = cleanTitle(model)
+	if v := strings.ToLower(strings.TrimSpace(version)); v == "" || strings.Contains(strings.ToLower(model), v) {
+		return cleanName(model)
+	}
+	return cleanName(model, version)
+}
+
+// localSaveName is the name for a model file that is not a liked model but
+// that Civitai knows by its checksum, under -name (current: its name now,
+// without a base model tag).
+func localSaveName(current, model, version string) (string, string) {
+	if model == "" || nameMode == "civitai" {
+		return current, ""
+	}
+	why := "-name model"
+	if nameMode == "auto" {
+		if !genericName(current) {
+			return current, ""
+		}
+		why = fmt.Sprintf("its file name %q says nothing about it", current)
+	}
+	built := modelFileName(model, version)
+	if built == "" {
+		return current, ""
+	}
+	return built + strings.ToLower(filepath.Ext(current)), why
 }
 
 var tagModes = []string{"front", "end", "dot", "folder", "none"}
@@ -2483,7 +2637,7 @@ func lookupLocal(ctx context.Context, c *client, idx *index, st *stateFile, res 
 		switch {
 		case e.VersionID != 0 && (!enabled || e.Base == "" || opt.previews == 0 || previewExists(l.path, opt.previews)):
 			// Known from an earlier run and nothing to fetch: no need to ask.
-			v = &hashVersion{apiVersion: apiVersion{ID: e.VersionID, BaseModel: e.BaseName}}
+			v = &hashVersion{apiVersion: apiVersion{ID: e.VersionID, BaseModel: e.BaseName, Name: e.VersionName}}
 			v.Model.Name, v.Model.Type = e.Model, e.ModelType
 		case !enabled:
 			why = "not looked up on Civitai (-local does that)"
@@ -2509,6 +2663,12 @@ func lookupLocal(ctx context.Context, c *client, idx *index, st *stateFile, res 
 		tag, how := "", ""
 		if v != nil {
 			e.VersionID, e.ModelType, e.Model, e.BaseName = v.ID, v.Model.Type, v.Model.Name, strings.TrimSpace(v.BaseModel)
+			if v.Name != "" {
+				e.VersionName = v.Name
+			}
+			if v.Model.Name != "" {
+				e.Title, e.Version = cleanTitle(v.Model.Name), e.VersionName
+			}
 			t := baseTag(v.BaseModel)
 			if baseAgnostic[v.Model.Type] || noTag(t) {
 				e.Base = ""
@@ -2556,9 +2716,17 @@ func lookupLocal(ctx context.Context, c *client, idx *index, st *stateFile, res 
 			it.images = previewImages(v.apiVersion, nil)
 		}
 		it.note = rel + " (" + how + ")"
-		want := ggufHome(idx, desiredPath(l.path, tag, untag(tag, filepath.Base(l.path))))
+		current := untag(tag, filepath.Base(l.path))
+		save, why := current, ""
+		if v != nil {
+			save, why = localSaveName(current, v.Model.Name, v.Name)
+		}
+		want := ggufHome(idx, desiredPath(l.path, tag, save))
 		if !strings.EqualFold(want, l.path) {
 			it.rename = want
+			if why != "" {
+				it.note = joinNote(it.note, "new name from the model: "+why)
+			}
 		}
 		res.items = append(res.items, it)
 	}

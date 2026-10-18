@@ -164,7 +164,11 @@ Hosts are plain names (`openrouter.ai`), comma or space separated in the variabl
 
 ## Model Preview Popup
 
-Hover a model in the Model Library sidebar to see a large popup with the preview images saved beside the model file, its base model, and the title, trigger phrase, author, and description from its metadata when present.
+Hover a model in the Model Library sidebar to see a large popup with the preview images saved beside the model file, its base model, its name, and the trigger phrase, author, and description from its metadata when present.
+
+### Model names
+
+ComfyUI labels a model with the title its trainer wrote into the file, which is often `ComfyUI1`, `last`, or `tst_01`. For files moFlo knows (liked models, and others it found on Civitai by checksum), the sidebar and the popup show the model's name on Civitai instead, without the base model list authors put at its end: `1950's (Technicolor) style XL + F1D + Illu + Pony + zit + zib` shows as `1950's (Technicolor) style`, `Crystals [FLUX+SDXL+PONY+1.5]` as `Crystals`. A lone base word that may be part of the name (`Juggernaut XL`) stays. The popup adds the version and the trainer's title in small print. For other files with a title that says nothing, the file name is shown. Nothing in the file changes.
 
 ### Previews
 
@@ -271,6 +275,7 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | `-models` | `~/ComfyUI/models` | ComfyUI models folder |
 | `-base` | from the config | Base models to handle this run (downloads, renames, previews), comma separated, as tags (`flux1_dev`) or Civitai names (`"Flux.1 D"`); `all` handles every base. Without it, the config's choice applies. |
 | `-tag` | `front` | Where the base model tag goes in file names; see [File names](#file-names). |
+| `-name` | `auto` | What downloaded files are called: `auto`, `civitai` or `model`; see [File names](#file-names). |
 | `-previews` | `1` | Preview images to keep per model file (`0` for none) |
 | `-previews-only` | off | Only fetch missing previews for liked models already on disk |
 | `-preview-info` | off | Also save generation settings for preview pictures already on disk that have none; see [Previews](#what-it-does) |
@@ -291,6 +296,7 @@ Start with `-n` to see the plan before anything is written. Ctrl+C stops cleanly
 | `-set-conf` | | Save the flags given on the command line into the config file as the new defaults (`-base` sets which base models are downloaded). `-n` is never saved. |
 | `-reconfig` | | List the base models in your likes again and ask which to download |
 | `-print-config` | | Print the config as it applies to this run, and exit |
+| `-version` | | Print the version and exit |
 
 `-rename-only` cannot be combined with `-previews-only` or `-ea`, and `-previews-only` cannot be combined with `-ea`.
 
@@ -362,6 +368,18 @@ The tool only ever rewrites its own parts. If you edit the file while a run is g
 
 ### File names
 
+**The name.** `-name` picks it:
+
+| `-name` | Result |
+| --- | --- |
+| `auto` | Civitai's file name, unless it says nothing or another liked model uses the same one. Then the model's name and version: `World of Filaments (V2 "Glass")` becomes `World_of_Filaments_V2_Glass.safetensors`. A name says nothing when it is a trainer's or ComfyUI's default (`ComfyUI1`, `ComfyUI 1`, `lora`, `last`, `pytorch_lora_weights`), a UUID, a number, a base model's name (`sdxl`), or when what is left once counters, versions and base model words are taken off is five letters or fewer (`tst_01`, `kids4`, `trip4`). |
+| `civitai` | Civitai's file name, always. |
+| `model` | The model's name and version, always. |
+
+Built names start from the model's name without the base model list at its end (see [Model names](#model-names)), then keep letters of any script, digits, `-` and `.`; spaces and other characters become single underscores, apostrophes, brackets, quotes and emoji are dropped, and names are cut at 120 characters. Files you already have are found under either name. With `-rename` they are renamed to the new one, previews included; the plan says why. Model files that are not liked models but that Civitai knows by their checksum (`-local`, or found by an earlier `-local` run) are named the same way; for those found before this version, the name is built from the model name alone. Saved ComfyUI workflows refer to LoRAs and checkpoints by file name, so `-name model -rename` on a big collection breaks those workflows; `auto` only touches names that were useless anyway.
+
+**The base model tag.**
+
 Files are saved with their base model tag in the name, so loader lists group by base model. `-tag` picks the form:
 
 | `-tag` | Result |
@@ -380,8 +398,8 @@ Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `
 
 - **Versions.** A liked model with versions for several base models gets one file per selected base model, the newest version for each.
 - **Placement.** Each Civitai model type goes to its ComfyUI folder: checkpoints, `loras` (LORA, LoCon, DoRA), `embeddings`, `vae`, `controlnet`, `upscale_models`, `hypernetworks`, `animatediff_models`.
-- **Duplicate checks.** Before downloading, each file is checked against the whole models tree, whatever folder it was filed under and whichever `-tag` form it has: first by name for every version, then by size and SHA-256 to catch a copy saved under another name. Only what is missing is downloaded, and nothing is ever overwritten. A file that could be a liked file under another name (the same size, or the same name for two liked files) is checksummed to settle it, once; the checksum is kept. Only when Civitai gives no checksum to compare with is a same-size file left alone and listed.
-- **Copies and leftovers.** The same file stored twice in one models folder (as two runs with different `-tag` leave behind, `loras/sdxl1/x` and `loras/sdxl1_x`, say) is found by checksum and cut down to one: the copy named the way `-tag` names files now is kept (else the one with the most previews, else the oldest), and its twin's previews and settings files move over when it lacks them. A partial download (`.part`) whose finished file is already there is removed. Both are listed in the plan with the space they free, and happen only when you say yes. A file a symbolic link points to is never removed or renamed, and copies in different folders (`loras` and `checkpoints`) are left alone.
+- **Duplicate checks.** Before downloading, each file is checked against the whole models tree, whatever folder it was filed under and whichever `-tag` form it has: first by name for every version, then by size and SHA-256 to catch a copy saved under another name. Only what is missing is downloaded, and nothing is ever overwritten. A file that could be a liked file under another name (the same size, or the same name for two liked files) needs a checksum to settle it. moFlo asks first: it lists each file it wants to checksum with the reason, the total size, and what happens without it, and checksums only on yes (`-yes` says yes; no answer counts as no). Each file is checksummed once and the result kept, so the question does not come back for it. Said no, such a file is left alone and so is the liked file it may be, so nothing is downloaded twice; the next run asks again. `-checksum` and `-local` are themselves the request, so they do not ask.
+- **Copies and leftovers.** The same file stored twice in one models folder (as two runs with different `-tag` leave behind, `loras/sdxl1/x` and `loras/sdxl1_x`, say) is found by checksum (asked first, as above) and cut down to one: the copy named the way `-tag` names files now is kept (else the one with the most previews, else the oldest), and its twin's previews and settings files move over when it lacks them. A partial download (`.part`) whose finished file is already there is removed, and so is a failed download (`.unverified`) of a file now on disk and checksummed, under any `-tag` form. Both are listed in the plan with the space they free, and happen only when you say yes. A file a symbolic link points to is never removed or renamed, and copies in different folders (`loras` and `checkpoints`) are left alone.
 - **Previews.** Each model file gets the first still image from its Civitai page saved beside it as `<name>.preview.<ext>`, safe-for-work images first. With `-previews N`, extras are saved as `<name>.preview-2.<ext>` and so on; rename the one you want to `<name>.preview.<ext>` to make it the icon (rename its `.json` with it, or the settings stay with the old name). Files you already have get previews too, unless one is already there. Beside each preview goes `<name>.preview.json` (`.preview-N.json` for extras) with what Civitai records about how that picture was made, which Model Preview Popup shows; when the model listing carries none, the version's image gallery is checked. Previews saved before this existed get theirs with `-preview-info`: which Civitai image a picture is cannot be told from its name, so up to 16 of the model's images are downloaded again and matched byte for byte. Pictures that match none (your own, say) are counted and left alone.
 - **Other model files.** With `-local`, model files no liked model accounts for (in `checkpoints`, `loras`, `diffusion_models`, `unet`, `embeddings`, `controlnet`, `hypernetworks`, `vae`, `animatediff_models`) are checksummed once and looked up on Civitai, so they get tagged and previewed like the rest. With `-guess`, files Civitai does not know, such as your own trainings, are tagged from the base model their metadata names. Whatever is left without a base model is listed with the reason.
 - **Checksums.** The state file records what has been seen. Downloads are always checksummed to verify them; a download that fails is kept aside as `<name>.unverified`, hidden from ComfyUI, and downloaded again on the next run; the bad copy goes once a good one checks out. Other files are checksummed when they might be a liked file or a copy (see above), with `-checksum`, or with `-local`, each once.
@@ -391,7 +409,7 @@ Tags are short forms of Civitai's base model names: `Flux.1 D` is `flux1_dev`, `
 
 ### State file
 
-`<models>/.moflo.json` records each model file's size, date, checksum, Civitai version, and base model, plus the early access refusals. Model Preview Popup reads it to label base models. It is safe to delete; the next run rebuilds what it can, but checksums are lost and have to be redone.
+`<models>/.moflo.json` records each model file's size, date, checksum, Civitai version, base model, and title (the model's name on Civitai without the base model list at its end), plus the early access refusals. Model Preview Popup reads it to label base models and name models. It is safe to delete; the next run rebuilds what it can, but checksums are lost and have to be redone.
 
 ## HTTP routes
 
