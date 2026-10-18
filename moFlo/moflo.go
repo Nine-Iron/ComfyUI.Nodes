@@ -93,10 +93,12 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 const (
-	userAgent     = "moflo/1.0"
+	version       = "2026.10.18-1" // bumped with every build handed out
+	userAgent     = "moflo/" + version
 	sizeSlack     = 1024             // bytes; the API reports sizes in KB
 	stallTimeout  = 2 * time.Minute  // abort a download that stops sending data
 	apiTimeout    = 60 * time.Second // per API request
@@ -751,11 +753,18 @@ func inTagForm(path string) bool {
 	return false
 }
 
-// findCopies finds model files stored more than once: the same bytes under the
-// same models folder, as two runs with different -tag leave behind. Files that
-// could be copies (same size, and the same name once tags are taken off, or a
-// checksum on record) are checksummed to make sure; links are never counted.
-func findCopies(ctx context.Context, idx *index, st *stateFile) ([]copyGroup, error) {
+// ------------------------------------------------- checksums moFlo wants
+
+// hashJob is a file moFlo would like to checksum, and why.
+type hashJob struct {
+	l   localFile
+	why string
+}
+
+// copyCandidates lists files that look like copies of each other (the same
+// size in one models folder, and the same name once base model tags are taken
+// off) and have no checksum on record yet.
+func copyCandidates(idx *index) []hashJob {
 	type key struct {
 		top  string
 		size int64
@@ -767,38 +776,144 @@ func findCopies(ctx context.Context, idx *index, st *stateFile) ([]copyGroup, er
 			bySize[k] = append(bySize[k], l)
 		}
 	}
-	var hashNow []localFile
-	var hashBytes int64
-	suspects := map[string]bool{}
+	var out []hashJob
 	for _, group := range bySize {
 		if len(group) < 2 {
 			continue
 		}
-		names := map[string]int{}
 		for _, l := range group {
-			names[untagged(l.path)]++
-		}
-		for _, l := range group {
-			if names[untagged(l.path)] > 1 || idx.shaByPath[l.path] != "" {
-				suspects[l.path] = true
-				if idx.shaByPath[l.path] == "" {
-					hashNow = append(hashNow, l)
-					hashBytes += l.size
+			if idx.shaByPath[l.path] != "" {
+				continue
+			}
+			for _, o := range group {
+				if o.path != l.path && untagged(o.path) == untagged(l.path) {
+					out = append(out, hashJob{l, fmt.Sprintf("looks like a copy of %s (same size, same name apart "+
+						"from the base model tag); if it is, one of the two can go", idx.rel(o.path))})
+					break
 				}
 			}
 		}
 	}
-	if len(hashNow) > 0 {
-		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that look like copies of each other, %s...\n", len(hashNow), human(hashBytes))
+	return out
+}
+
+// ambiguousCandidates lists files with no checksum on record that may be a
+// liked file under another name, and the files whose name and size fit more
+// than one liked file (unsure: left alone unless checksummed).
+func ambiguousCandidates(idx *index, models []apiModel) ([]hashJob, map[string]bool) {
+	claims := map[string]map[string]bool{} // local path -> liked files that fit it by name and size
+	shared := sharedNames(models)
+	type liked struct {
+		size  int64
+		label string
 	}
-	for i, l := range hashNow {
-		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(hashNow), idx.rel(l.path), human(l.size))
+	var withSum []liked
+	for _, m := range models {
+		for _, v := range m.ModelVersions {
+			f, ok := modelFile(v)
+			if !ok {
+				continue
+			}
+			tag := ""
+			if !baseAgnostic[m.Type] {
+				tag = baseTag(v.BaseModel)
+			}
+			label := m.Name
+			if tag != "" {
+				label += " [" + tag + "]"
+			}
+			if f.sha256() != "" && f.bytes() > 0 {
+				withSum = append(withSum, liked{f.bytes(), label})
+			}
+			save, _ := saveName(m, v, f, shared)
+			for _, name := range (candidate{file: f, tag: tag, save: save}).names() {
+				for _, l := range idx.byName[strings.ToLower(name)] {
+					if f.bytes() == 0 || sizeClose(l.size, f.bytes()) {
+						if claims[l.path] == nil {
+							claims[l.path] = map[string]bool{}
+						}
+						claims[l.path][label] = true
+					}
+				}
+			}
+		}
+	}
+	list := func(names []string) string {
+		sort.Strings(names)
+		names = slices.Compact(names)
+		if len(names) > 3 {
+			return strings.Join(names[:3], ", ") + fmt.Sprintf(" and %d more", len(names)-3)
+		}
+		return strings.Join(names, ", ")
+	}
+	var out []hashJob
+	unsure := map[string]bool{}
+	for _, l := range idx.all {
+		if idx.shaByPath[l.path] != "" || !isModelFile(l.path) {
+			continue
+		}
+		if len(claims[l.path]) > 1 {
+			unsure[l.path] = true
+			out = append(out, hashJob{l, fmt.Sprintf("its name and size fit %d liked files (%s); only its checksum "+
+				"tells which one it is, so the others are not downloaded until then",
+				len(claims[l.path]), list(slices.Collect(maps.Keys(claims[l.path]))))})
+			continue
+		}
+		var same []string
+		for _, w := range withSum {
+			if sizeExact(l.size, w.size) {
+				same = append(same, w.label)
+			}
+		}
+		if len(same) > 0 {
+			unsure[l.path] = true
+			out = append(out, hashJob{l, fmt.Sprintf("exactly the size of liked %s; if it is one of them under "+
+				"another name, that one is not downloaded again. Unchecked, those stay left alone", list(same))})
+		}
+	}
+	return out, unsure
+}
+
+// askChecksums says which files moFlo wants to checksum and why, and asks.
+// -yes answers yes; no answer to read counts as no.
+func askChecksums(idx *index, jobs []hashJob, yes bool) bool {
+	var total int64
+	for _, j := range jobs {
+		total += j.l.size
+	}
+	fmt.Printf("\nmoFlo would like to checksum %d file(s), %s, before planning. That reads every byte, so it\n", len(jobs), human(total))
+	fmt.Println("takes a while for big files; each one is done once and remembered. Why:")
+	for _, j := range jobs {
+		fmt.Printf("  %s  (%s)\n      %s\n", idx.rel(j.l.path), human(j.l.size), j.why)
+	}
+	fmt.Println("If not: copies are not cleaned up, and liked files that may already be here are left alone")
+	fmt.Println("(listed below) rather than downloaded twice. You are asked again next run.")
+	if yes {
+		fmt.Println("Checksumming them (-yes).")
+		return true
+	}
+	fmt.Print("Checksum them now? [y/N] ")
+	answer, err := stdin.ReadString('\n')
+	if err != nil && strings.TrimSpace(answer) == "" {
+		fmt.Println("\nNo answer to read: not checksummed (-yes says yes).")
+		return false
+	}
+	a := strings.ToLower(strings.TrimSpace(answer))
+	return a == "y" || a == "yes"
+}
+
+// hashJobs checksums the files and records the results in the index and state.
+func hashJobs(ctx context.Context, idx *index, st *stateFile, jobs []hashJob) error {
+	for i, j := range jobs {
+		l := j.l
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(jobs), idx.rel(l.path), human(l.size))
 		sum, err := hashFile(ctx, l.path)
 		if err != nil {
 			if ctx.Err() != nil {
 				st.saveOrWarn()
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
+			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
 			continue
 		}
 		idx.shaByPath[l.path] = sum
@@ -806,13 +921,19 @@ func findCopies(ctx context.Context, idx *index, st *stateFile) ([]copyGroup, er
 		if e := st.Files[idx.rel(l.path)]; e != nil {
 			e.SHA256 = sum
 		}
+		st.saveOrWarn()
 	}
-	st.saveOrWarn()
+	return nil
+}
 
+// groupCopies finds model files stored more than once: the same bytes (by
+// the checksums on record) under the same models folder, as two runs with
+// different -tag leave behind. Links are never counted as copies.
+func groupCopies(idx *index) []copyGroup {
 	type hkey struct{ top, sha string }
 	byHash := map[hkey][]localFile{}
 	for _, l := range idx.all {
-		if sha := idx.shaByPath[l.path]; sha != "" && suspects[l.path] {
+		if sha := idx.shaByPath[l.path]; sha != "" && isModelFile(l.path) {
 			k := hkey{topFolder(idx, l.path), sha}
 			byHash[k] = append(byHash[k], l)
 		}
@@ -877,7 +998,7 @@ func findCopies(ctx context.Context, idx *index, st *stateFile) ([]copyGroup, er
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].keep.path < out[j].keep.path })
-	return out, nil
+	return out
 }
 
 // linkTargets lists the files symbolic links in the tree point to.
@@ -902,17 +1023,28 @@ func isLinkTarget(targets []os.FileInfo, fi os.FileInfo) bool {
 	return false
 }
 
-// staleParts lists partial downloads whose finished file is already there:
-// left over when another run finished the same file first.
+// staleParts lists leftovers whose finished file is already there: partial
+// downloads (.part) another run finished first, and failed downloads
+// (.unverified) of a file now on disk and checksummed, under any -tag form.
 func staleParts(idx *index) []localFile {
 	have := map[string]bool{}
+	good := map[string]bool{} // top folder + untagged name of checksummed model files
 	for _, l := range idx.all {
 		have[l.path] = true
+		if isModelFile(l.path) && idx.shaByPath[l.path] != "" {
+			good[topFolder(idx, l.path)+"/"+untagged(l.path)] = true
+		}
 	}
 	var out []localFile
 	for _, l := range idx.all {
-		if strings.HasSuffix(l.path, ".part") && have[strings.TrimSuffix(l.path, ".part")] {
+		switch {
+		case strings.HasSuffix(l.path, ".part") && have[strings.TrimSuffix(l.path, ".part")]:
 			out = append(out, l)
+		case strings.HasSuffix(l.path, ".unverified"):
+			fin := strings.TrimSuffix(l.path, ".unverified")
+			if have[fin] || good[topFolder(idx, fin)+"/"+untagged(fin)] {
+				out = append(out, l)
+			}
 		}
 	}
 	return out
@@ -1366,6 +1498,129 @@ func baseTag(name string) string {
 }
 
 // Where the base model tag goes when a file is saved or renamed (-tag).
+// ----------------------------------------------------------- saved file names
+
+// nameMode says what a downloaded model file is called (-name):
+//
+//	civitai  the file name Civitai lists, untouched
+//	model    built from the model's name and version on Civitai
+//	auto     Civitai's name, unless it says nothing (ComfyUI1, lora, a UUID...)
+//	         or another liked model uses the same one: then the built name
+var nameModes = []string{"auto", "civitai", "model"}
+var nameMode = "auto"
+
+var genericStems = map[string]bool{"comfyui": true, "lora": true, "loras": true, "model": true, "models": true,
+	"pytorch_lora_weights": true, "lora_weights": true, "adapter_model": true, "diffusion_pytorch_model": true,
+	"last": true, "final": true, "output": true, "untitled": true, "checkpoint": true, "test": true, "new": true,
+	"my_lora": true, "mylora": true, "unnamed": true, "download": true, "file": true, "style": true, "v": true}
+
+var hexRun = regexp.MustCompile(`(?i)[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}`)
+
+// genericName reports whether a file name tells nothing about the model:
+// what a trainer or ComfyUI saves by default, a UUID, or just a number.
+func genericName(name string) bool {
+	stem := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
+	if hexRun.MatchString(stem) {
+		return true
+	}
+	// Drop counters and separators at the end: ComfyUI_00001_, lora-000010, last 2.
+	core := strings.TrimRight(stem, "0123456789_-. ")
+	if strings.HasPrefix(core, "comfyui") {
+		return true
+	}
+	if genericStems[strings.ReplaceAll(core, " ", "_")] {
+		return true
+	}
+	letters := 0
+	for _, r := range core {
+		if unicode.IsLetter(r) {
+			letters++
+		}
+	}
+	return letters < 2
+}
+
+// cleanName turns a model name and version into a file name: letters (any
+// script), digits, - and . stay; spaces and the rest become single underscores;
+// brackets, quotes, slashes and emoji go.
+func cleanName(parts ...string) string {
+	var b strings.Builder
+	under := false
+	for _, p := range parts {
+		for _, r := range p {
+			switch {
+			case r == '\'' || r == '’' || r == '`':
+				// Zavy's -> Zavys
+			case unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.':
+				b.WriteRune(r)
+				under = false
+			case !under && b.Len() > 0:
+				b.WriteByte('_')
+				under = true
+			}
+		}
+		if !under && b.Len() > 0 {
+			b.WriteByte('_')
+			under = true
+		}
+	}
+	s := strings.Trim(b.String(), "_-.")
+	for strings.Contains(s, "_-_") {
+		s = strings.ReplaceAll(s, "_-_", "-")
+	}
+	if r := []rune(s); len(r) > 120 {
+		s = strings.TrimRight(string(r[:120]), "_-.")
+	}
+	return s
+}
+
+// sharedNames counts, per lower-case Civitai file name, the liked models using it.
+func sharedNames(models []apiModel) map[string]int {
+	ids := map[string]map[int64]bool{}
+	for _, m := range models {
+		for _, v := range m.ModelVersions {
+			if f, ok := modelFile(v); ok {
+				k := strings.ToLower(f.Name)
+				if ids[k] == nil {
+					ids[k] = map[int64]bool{}
+				}
+				ids[k][m.ID] = true
+			}
+		}
+	}
+	out := map[string]int{}
+	for k, s := range ids {
+		out[k] = len(s)
+	}
+	return out
+}
+
+// saveName is the name a model file is saved under, and why it is not
+// Civitai's own (empty when it is).
+func saveName(m apiModel, v apiVersion, f apiFile, shared map[string]int) (string, string) {
+	why := ""
+	switch nameMode {
+	case "civitai":
+		return f.Name, ""
+	case "model":
+		why = "-name model"
+	default:
+		switch {
+		case genericName(f.Name):
+			why = fmt.Sprintf("Civitai's file name %q says nothing about it", f.Name)
+		case shared[strings.ToLower(f.Name)] > 1:
+			why = fmt.Sprintf("Civitai's file name %q is used by %d liked models", f.Name, shared[strings.ToLower(f.Name)])
+		default:
+			return f.Name, ""
+		}
+	}
+	built := cleanName(m.Name, v.Name)
+	if built == "" {
+		return f.Name, ""
+	}
+	return built + strings.ToLower(filepath.Ext(f.Name)), why
+}
+
 var tagModes = []string{"front", "end", "dot", "folder", "none"}
 var tagMode = "front"
 
@@ -1654,7 +1909,9 @@ type candidate struct {
 	ver    apiVersion
 	file   apiFile
 	tag    string
-	tagged string // file name on disk: base tag + Civitai's name
+	tagged string // file name on disk: base tag + the name it is saved under
+	save   string // the name it is saved under (-name); file.Name is Civitai's
+	why    string // why save differs from Civitai's name
 }
 
 type planOptions struct {
@@ -1686,6 +1943,16 @@ type planResult struct {
 	names   map[string]string // base tag -> what Civitai calls it
 	matched map[string]bool   // selected tags that at least one liked model has
 	off     []item            // liked models of base models not handled (for the config's lists)
+}
+
+// names lists every file name a copy of this candidate may have on disk: its
+// saved name and Civitai's, each in every -tag form.
+func (cd candidate) names() []string {
+	out := tagForms(cd.tag, cd.file.Name)
+	if cd.save != cd.file.Name {
+		out = append(out, tagForms(cd.tag, cd.save)...)
+	}
+	return out
 }
 
 // modelFile picks the file of a version that is the model itself.
@@ -1727,6 +1994,7 @@ func versionLabel(v apiVersion) string {
 func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptions) *planResult {
 	res := &planResult{others: map[string]int{}, names: map[string]string{}, matched: map[string]bool{}}
 	planned := map[string]string{} // lower-case file name -> model that claimed it
+	shared := sharedNames(models)
 
 	// evaluate decides what to do about one model for one base model.
 	// cands are that base's versions, newest first.
@@ -1748,8 +2016,11 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			if i > 0 {
 				it.note += fmt.Sprintf("; that is version %q, the newest is %q", cd.ver.Name, target.ver.Name)
 			}
-			if want := ggufHome(idx, desiredPath(l.path, cd.tag, cd.file.Name)); !strings.EqualFold(want, l.path) {
+			if want := ggufHome(idx, desiredPath(l.path, cd.tag, cd.save)); !strings.EqualFold(want, l.path) {
 				it.rename = want
+				if cd.why != "" && !strings.EqualFold(untagged(want), untagged(l.path)) {
+					it.note = joinNote(it.note, "new name from the model: "+cd.why)
+				}
 			}
 			return it
 		}
@@ -1759,7 +2030,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 		//    Where both checksums are known they must agree: an SDXL and a Pony
 		//    version of a LoRA can share a name and a size.
 		for i, cd := range check {
-			for _, name := range tagForms(cd.tag, cd.file.Name) {
+			for _, name := range cd.names() {
 				for _, l := range idx.byName[strings.ToLower(name)] {
 					if cd.file.bytes() != 0 && !sizeClose(l.size, cd.file.bytes()) {
 						continue
@@ -1769,7 +2040,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 					}
 					if opt.unsure[l.path] {
 						it.status = stAlone
-						it.note = idx.rel(l.path) + " fits more than one liked file by name and size (two base models' versions?); -checksum tells which it is"
+						it.note = idx.rel(l.path) + " fits more than one liked file by name and size (two base models' versions?); not checksummed this run, so not sure which"
 						return it
 					}
 					return have(l, cd, "", i)
@@ -1824,7 +2095,7 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 				if cd.file.sha256() == "" {
 					it.note = fmt.Sprintf("%s is the same size and Civitai gave no checksum to tell them apart", idx.rel(l.path))
 				} else {
-					it.note = fmt.Sprintf("%s is exactly the same size and has not been checksummed; run with -checksum to settle it", idx.rel(l.path))
+					it.note = fmt.Sprintf("%s is exactly the same size and not checksummed this run, so it may be this file; not downloaded twice", idx.rel(l.path))
 				}
 				return it
 			}
@@ -1847,6 +2118,9 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			}
 			if retry != "" {
 				it.note = joinNote(it.note, retry+" failed its checksum before; downloading it again")
+			}
+			if target.why != "" {
+				it.note = joinNote(it.note, "named from the model: "+target.why)
 			}
 		}
 		return it
@@ -1878,7 +2152,8 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 			if _, seen := groups[tag]; !seen {
 				order = append(order, tag)
 			}
-			groups[tag] = append(groups[tag], candidate{v, f, tag, taggedName(tag, f.Name)})
+			save, why := saveName(m, v, f, shared)
+			groups[tag] = append(groups[tag], candidate{ver: v, file: f, tag: tag, tagged: taggedName(tag, save), save: save, why: why})
 		}
 		if len(order) == 0 {
 			note := "no downloadable file"
@@ -1910,94 +2185,6 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 	}
 	settle(res, st, idx, opt, 0)
 	return res
-}
-
-// checksumAmbiguous checksums the files that more than one liked file could
-// be by name and size (the same name under two base models, or two models), so
-// that plan can tell them apart. Checksums are kept in the state file.
-// Without -checksum nothing is hashed: the files are returned instead, and plan
-// leaves them alone rather than guess.
-func checksumAmbiguous(ctx context.Context, idx *index, st *stateFile, models []apiModel, hash bool) (map[string]bool, error) {
-	claims := map[string]map[string]bool{} // local path -> candidate keys that fit it
-	for _, m := range models {
-		for _, v := range m.ModelVersions {
-			f, ok := modelFile(v)
-			if !ok {
-				continue
-			}
-			tag := ""
-			if !baseAgnostic[m.Type] {
-				tag = baseTag(v.BaseModel)
-			}
-			key := fmt.Sprintf("%d/%s/%s", m.ID, tag, f.sha256())
-			for _, name := range tagForms(tag, f.Name) {
-				for _, l := range idx.byName[strings.ToLower(name)] {
-					if f.bytes() == 0 || sizeClose(l.size, f.bytes()) {
-						if claims[l.path] == nil {
-							claims[l.path] = map[string]bool{}
-						}
-						claims[l.path][key] = true
-					}
-				}
-			}
-		}
-	}
-	// Also any model file exactly the size of a liked file Civitai has a
-	// checksum for: it may be that file under another name, and only its
-	// checksum tells. Each is checksummed once; the result is kept.
-	var sizes []int64
-	for _, m := range models {
-		for _, v := range m.ModelVersions {
-			if f, ok := modelFile(v); ok && f.sha256() != "" && f.bytes() > 0 {
-				sizes = append(sizes, f.bytes())
-			}
-		}
-	}
-	var todo []localFile
-	var todoBytes int64
-	unsure := map[string]bool{}
-	for _, l := range idx.all {
-		if idx.shaByPath[l.path] != "" || !isModelFile(l.path) {
-			continue
-		}
-		sameSize := false
-		for _, s := range sizes {
-			if sizeExact(l.size, s) {
-				sameSize = true
-				break
-			}
-		}
-		if len(claims[l.path]) > 1 || sameSize {
-			todo = append(todo, l)
-			todoBytes += l.size
-			unsure[l.path] = true
-		}
-	}
-	if !hash {
-		return unsure, nil
-	}
-	if len(todo) > 0 {
-		fmt.Fprintf(os.Stderr, "Checksumming %d file(s) that may be a liked file under another name, %s (once each)...\n", len(todo), human(todoBytes))
-	}
-	for i, l := range todo {
-		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(todo), idx.rel(l.path), human(l.size))
-		sum, err := hashFile(ctx, l.path)
-		if err != nil {
-			if ctx.Err() != nil {
-				st.saveOrWarn()
-				return nil, ctx.Err()
-			}
-			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
-			continue
-		}
-		if e := st.Files[idx.rel(l.path)]; e != nil {
-			e.SHA256 = sum
-		}
-		idx.byHash[sum] = append(idx.byHash[sum], l)
-		idx.shaByPath[l.path] = sum
-		st.saveOrWarn()
-	}
-	return nil, nil
 }
 
 // settle works out the renames and previews for res.items[from:]; items
@@ -2757,7 +2944,7 @@ type config struct {
 }
 
 // Flags that are not settings: they steer the config itself.
-var notSettings = map[string]bool{"config": true, "print-config": true, "set-conf": true, "reconfig": true, "base": true}
+var notSettings = map[string]bool{"config": true, "print-config": true, "set-conf": true, "reconfig": true, "base": true, "version": true}
 
 var configAbout = []string{
 	"moFlo config. Flags on the command line win for that run; add -set-conf to save them here.",
@@ -3456,6 +3643,12 @@ func run() int {
 	stateOpt := flag.String("state", "", "state file (default <models>/.moflo.json)")
 	tokenFile := flag.String("token-file", filepath.Join(home, ".config", "civitai", "token"), "file holding the API token")
 	apiBase := flag.String("api", "https://civitai.com", "Civitai base URL")
+	nameFlag := flag.String("name", "auto", "what downloaded model files are called:\n"+
+		"  auto     Civitai's file name, unless it says nothing (ComfyUI1, lora, a UUID, a number)\n"+
+		"           or another liked model uses it too: then the model's name and version\n"+
+		"  civitai  Civitai's file name, always\n"+
+		"  model    the model's name and version, always (with -rename, files you have are\n"+
+		"           renamed too; saved ComfyUI workflows refer to files by name)")
 	tagFlag := flag.String("tag", "front", "where the base model tag goes in file names:\n"+
 		"  front   flux1_dev_name.safetensors\n"+
 		"  end     name_flux1_dev.safetensors\n"+
@@ -3465,10 +3658,15 @@ func run() int {
 	configPath := flag.String("config", defaultConfigPath(home), "config file (JSON): flag defaults, base models to download, and per base\n"+
 		"model the liked models with what became of them. Command-line flags win for that run")
 	printConfig := flag.Bool("print-config", false, "print the config as it applies to this run, and exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	setConf := flag.Bool("set-conf", false, "save the flags given on the command line into the config file as the new\n"+
 		"defaults (-base sets which base models are downloaded); -n is never saved")
 	reconfig := flag.Bool("reconfig", false, "list the base models in your likes again and ask which to download")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("moflo", version)
+		return 0
+	}
 	onCLI := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { onCLI[f.Name] = true })
 	legacy := ""
@@ -3524,6 +3722,11 @@ func run() int {
 		} else {
 			fmt.Printf("Saved to %s: %s\n", cfg.path, strings.Join(saved, ", "))
 		}
+	}
+	nameMode = strings.ToLower(strings.TrimSpace(*nameFlag))
+	if !slices.Contains(nameModes, nameMode) {
+		fmt.Fprintf(os.Stderr, "-name must be one of %s\n", strings.Join(nameModes, ", "))
+		return 2
 	}
 	tagMode = strings.ToLower(strings.TrimSpace(*tagFlag))
 	if !slices.Contains(tagModes, tagMode) {
@@ -3717,11 +3920,29 @@ func run() int {
 	}
 	// Copies of one file (two runs with different -tag, say) and partial
 	// downloads someone else finished: cleaned up, and left out of the plan.
-	copies, err := findCopies(ctx, idx, st)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
-		return 130
+	// Checksums moFlo wants on its own (-checksum has done the rest already):
+	// asked first, with the reason for each file.
+	jobs := copyCandidates(idx)
+	ambJobs, unsure := ambiguousCandidates(idx, models)
+	at := map[string]int{}
+	for i, j := range jobs {
+		at[j.l.path] = i
 	}
+	for _, j := range ambJobs {
+		if i, ok := at[j.l.path]; ok {
+			jobs[i].why += "\n      and " + j.why
+		} else {
+			jobs = append(jobs, j)
+		}
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].l.path < jobs[j].l.path })
+	if len(jobs) > 0 && askChecksums(idx, jobs, *yes) {
+		if err := hashJobs(ctx, idx, st, jobs); err != nil {
+			fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
+			return 130
+		}
+	}
+	copies := groupCopies(idx)
 	stale := staleParts(idx)
 	var cleanBytes int64
 	gone := map[string]bool{}
@@ -3738,9 +3959,11 @@ func run() int {
 	idx.drop(gone)
 	cleanN := len(gone)
 	opt.removing, opt.links = gone, linkTargets(idx)
-	if opt.unsure, err = checksumAmbiguous(ctx, idx, st, models, true); err != nil {
-		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
-		return 130
+	opt.unsure = map[string]bool{}
+	for p := range unsure {
+		if idx.shaByPath[p] == "" && !gone[p] {
+			opt.unsure[p] = true
+		}
 	}
 	res := plan(c, idx, st, models, opt)
 	ls, err := lookupLocal(ctx, c, idx, st, res, opt, *local && !eaOnly, *guess && !eaOnly)
@@ -4037,7 +4260,7 @@ func run() int {
 			}
 		}
 	} else if untagged > 0 && !*previewsOnly {
-		fmt.Printf("\n%d file(s) you already have do not carry their base model in the name; -rename renames them in place.\n", untagged)
+		fmt.Printf("\n%d file(s) you already have are not named the way -tag and -name say; -rename renames them in place.\n", untagged)
 	}
 
 	thumbsHave, thumbsNew, noImages := 0, 0, 0
@@ -4082,7 +4305,7 @@ func run() int {
 		}
 	}
 	if len(stale) > 0 {
-		fmt.Printf("\nPartial downloads whose finished file is already there, to remove (%d):\n", len(stale))
+		fmt.Printf("\nLeftover partial or failed downloads whose finished file is already there, to remove (%d):\n", len(stale))
 		for _, p := range stale {
 			fmt.Printf("  %s  (%s)\n", idx.rel(p.path), human(p.size))
 		}
