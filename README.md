@@ -1,12 +1,13 @@
 # ComfyUI.Nodes
 
-Four small tools for working with models and prompts in [ComfyUI](https://github.com/comfyanonymous/ComfyUI):
+Small tools for working with models and prompts in [ComfyUI](https://github.com/comfyanonymous/ComfyUI):
 
 | Folder | What it is | What it does |
 | --- | --- | --- |
 | [`Lora.Tag.Picker/`](#lora-tag-picker) | Custom node | Reads the training tags out of the LoRAs you have loaded and adds the ones you pick to your prompt. |
 | [`Prompt.Generator/`](#prompt-generator) | Custom nodes | Makes random prompts, from wildcard templates or by asking a language model (Claude, ChatGPT, or a local server). |
 | [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, with the prompt and settings each preview was made with, and lets you hide base models you don't use. |
+| [`Checkpoint.Sweep/`, `Sampler.Sweep/`, `Lora.Sweep/`](#sweeps) | Custom nodes | Change the checkpoint, sampler settings or LoRA strengths on every run of a batch, through every combination or at random. |
 | [`moFlo/`](#moflo) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
 
 Each one works on its own, and they work well together: moFlo saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
@@ -18,6 +19,7 @@ Each one works on its own, and they work well together: moFlo saves previews, th
 - [LoRA Tag Picker](#lora-tag-picker)
 - [Prompt Generator](#prompt-generator)
 - [Model Preview Popup](#model-preview-popup)
+- [Sweeps](#sweeps)
 - [moFlo](#moflo)
 - [HTTP routes](#http-routes)
 - [Troubleshooting](#troubleshooting)
@@ -39,6 +41,7 @@ cd ComfyUI.Nodes
 cp -r Lora.Tag.Picker     ~/ComfyUI/custom_nodes/
 cp -r Prompt.Generator    ~/ComfyUI/custom_nodes/
 cp -r Model.Preview.Popup ~/ComfyUI/custom_nodes/
+cp -r Checkpoint.Sweep Sampler.Sweep Lora.Sweep ~/ComfyUI/custom_nodes/
 ```
 
 To pick up updates with a `git pull`, symlink instead of copying:
@@ -216,6 +219,31 @@ The top of the popup names the model's base model (for example **Flux.1 D**). It
 Anything left over is **Unknown**.
 
 The **Base models** button in the popup opens a list of every base model found, with a file count for each. Untick a base model to hide its files from the Model Library and from loader dropdowns in the graph. A model already chosen in a node stays visible there. The filter applies to `checkpoints`, `loras`, `diffusion_models`, `unet`, `embeddings`, `controlnet`, and `hypernetworks`; text encoders, VAEs, and upscalers are always shown. The choice is saved in your ComfyUI user settings, so it follows you across browsers.
+
+## Sweeps
+
+Three controller nodes that change settings on other nodes right before each queued run, so one **Run × N** tries N different setups:
+
+| Node | Sets | On |
+| --- | --- | --- |
+| **Checkpoint Sweep** (loaders) | `ckpt_name`, `unet_name` | Load Checkpoint, Load Diffusion Model, Unet Loader (GGUF) |
+| **Sampler Sweep** (sampling) | `sampler_name`, `scheduler`, `steps`, `cfg` | KSampler |
+| **LoRA Strength Sweep** (loaders) | `strength_model`, `strength_clip` | LoRA loaders |
+
+Each setting has a mode: **off** (leave it alone), **sweep** (step through the list, one value per run) or **random** (pick one each run). The values are written into the target node's own widgets, so the workflow saved in each image shows what was really used, and a filename prefix like `%CheckpointLoaderSimple.ckpt_name%_%KSampler.steps%` labels the images.
+
+- **One counter for all of them.** Every sweep node in a workflow shares one counter and together they cover every combination. The status line shows the total ("12 combinations, set Run count to 12") and what the next run will use. **restart sweep** starts over from the first combination.
+- **The model changes slowest.** Checkpoint Sweep always comes first, so each model is loaded once and everything else is swept with it, rather than reloading a model every run. Among the other sweep nodes, the one highest on the canvas changes slowest.
+- **Which nodes it drives.** With nothing wired in, a sweep node drives every matching node in the workflow. To drive just one (say, the base checkpoint and not a refiner), wire that node's outputs through the sweep node: Checkpoint Sweep passes MODEL / CLIP / VAE through, Sampler Sweep passes LATENT through.
+- **Lists.** Names: a comma list, or patterns such as `sdxl1/*`, `*juggernaut*`, `dpmpp_*`. `*` or empty means every one the loader lists. Numbers: `20,30,40` or ranges `20-40:5` (from-to:step).
+
+### Checkpoint Sweep
+
+`checkpoint_mode` / `checkpoints` drive `ckpt_name`; `diffusion_mode` / `diffusion_models` drive `unet_name` (off by default). For a workflow with only Load Diffusion Model, set `checkpoint_mode` to off and `diffusion_mode` to sweep.
+
+`*` respects Model Preview Popup's base filter: base models you have hidden there are not swept.
+
+Every new model is a full load, which takes a while on small machines such as a Jetson, and **random** may load a different model every run. Prefer **sweep** for checkpoints, and keep the list short, for example a few patterns rather than `*` across a large folder.
 
 ## moFlo
 

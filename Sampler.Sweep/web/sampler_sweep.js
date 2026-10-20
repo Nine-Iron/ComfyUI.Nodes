@@ -4,10 +4,11 @@
 // Within the node, cfg changes fastest, then steps, scheduler, sampler.
 import { app } from "../../scripts/app.js";
 
-// Shared sweep engine. Sampler Sweep and LoRA Strength Sweep each ship a copy;
-// whichever loads first creates it and the other registers into it, so with
-// both installed all sweep nodes share one counter (a full grid of runs).
-const ENGINE_VERSION = 2;
+// Shared sweep engine. Sampler Sweep, LoRA Strength Sweep and Checkpoint Sweep
+// each ship a copy; whichever loads first creates it and the others register
+// into it, so all sweep nodes in a workflow share one counter (a full grid of
+// runs). Keep the copies identical and bump ENGINE_VERSION in all of them.
+const ENGINE_VERSION = 3;
 
 function createEngine(app, previous) {
   const KINDS = { ...(previous?.KINDS ?? {}) };
@@ -127,6 +128,10 @@ function createEngine(app, previous) {
       if (mode === "off") continue;
       if (mode === FOLLOW) { params.push({ ...p, mode }); continue; }
       const spec = widget(node, p.name)?.value ?? "";
+      if (p.kind === "combo" && tgs.length && !tgs.some((t) => widget(t, p.target))) {
+        errors.push(`${p.name}: no ${kind.noun} here has ${p.target} (set ${p.mode} to off)`);
+        continue;
+      }
       const res = p.kind === "combo"
         ? expandCombo(spec, comboOptions(tgs.map((t) => widget(t, p.target)).find(Boolean)))
         : expandNumbers(spec, p.kind);
@@ -155,7 +160,10 @@ function createEngine(app, previous) {
   // combined list of swept settings.
   function globalPlan(graph) {
     const plans = graphNodes(graph).filter((n) => kindOf(n) && active(n))
-      .sort((a, b) => (a.pos?.[1] ?? 0) - (b.pos?.[1] ?? 0) || (a.pos?.[0] ?? 0) - (b.pos?.[0] ?? 0))
+      // A kind's `order` puts it first (changing slowest): a model changes once
+      // per sweep of everything else, not every run. Then top of the canvas first.
+      .sort((a, b) => (kindOf(a).order ?? 0) - (kindOf(b).order ?? 0)
+        || (a.pos?.[1] ?? 0) - (b.pos?.[1] ?? 0) || (a.pos?.[0] ?? 0) - (b.pos?.[0] ?? 0))
       .map(buildPlan);
     const sweep = plans.filter((pl) => pl.ok).flatMap((pl) => pl.params.filter((p) => p.mode === "sweep").map((p) => ({ p, pl })));
     const total = sweep.reduce((n, s) => n * s.p.values.length, 1);
