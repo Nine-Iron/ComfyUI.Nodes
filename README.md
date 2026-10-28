@@ -110,7 +110,7 @@ Fills a template from word lists. Instant, uses no GPU memory, and the same seed
 
 | Input | Notes |
 | --- | --- |
-| `theme` | A built-in template (`scene`, `portrait`, `landscape`, `fantasy`, `sci-fi`, `photo`), `random` to pick one, or `custom (use template)`. |
+| `theme` | A built-in template (`scene`, `portrait`, `landscape`, `fantasy`, `dark fantasy`, `sci-fi`, `cyberpunk`, `photo`), `random` to pick one, or `custom (use template)`. |
 | `template` | Your own template. Used alone with `custom`; with another theme it is added after the themed prompt. |
 | `seed` | Same seed, same prompt. |
 | `prefix`, `suffix` | Optional. Expanded the same way and put before and after. |
@@ -124,7 +124,7 @@ Template syntax:
 | `__subject__` | A random line from `wildcards/subject.txt` |
 | `__folder/name__` | A wildcard file in a subfolder |
 
-Choices and wildcards can be nested. Wildcard files are plain text, one option per line, with `#` for comments. They are looked up in `ComfyUI/wildcards/`, then `ComfyUI/models/wildcards/`, then the node's own `wildcards/` folder, first match wins, so you can override a bundled list by putting a file of the same name in either of the first two. The bundled lists are `camera`, `color`, `lighting`, `mood`, `quality`, `setting`, `style`, `subject`, and `weather`. A missing wildcard is replaced by its name and reported in the console. Edited files are picked up without a restart.
+Choices and wildcards can be nested. Wildcard files are plain text, one option per line, with `#` for comments. They are looked up in `ComfyUI/wildcards/`, then `ComfyUI/models/wildcards/`, then the node's own `wildcards/` folder, first match wins, so you can override a bundled list by putting a file of the same name in either of the first two. The bundled shared lists are `camera`, `color`, `lighting`, `mood`, `quality`, `setting`, `style`, `subject`, and `weather`. Each theme except `scene` also has its own folder of lists (`portrait/`, `landscape/`, `fantasy/`, `dark-fantasy/`, `sci-fi/`, `cyberpunk/`, `photo/`), for example `__sci-fi/cosmic__` for black holes, twin suns and extra moons; override one with a file at the same path, such as `ComfyUI/wildcards/sci-fi/cosmic.txt`. A missing wildcard is replaced by its name and reported in the console. Edited files are picked up without a restart.
 
 ### LLM Prompt
 

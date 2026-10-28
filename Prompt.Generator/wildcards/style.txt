@@ -12,3 +12,25 @@ charcoal sketch
 macro photograph
 tilt-shift photograph
 vintage travel poster
+gouache painting
+pencil drawing
+pastel drawing
+impressionist painting
+ukiyo-e woodblock print
+pixel art
+claymation still
+papercut illustration
+stained glass artwork
+comic book panel
+children's book illustration
+matte painting
+surrealist painting
+baroque painting
+polaroid photo
+infrared photograph
+long exposure photograph
+cel-shaded illustration
+linocut print
+3d render
+art deco illustration
+watercolor and ink
