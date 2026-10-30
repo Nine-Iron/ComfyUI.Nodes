@@ -57,6 +57,7 @@
 //	moflo -previews-only -preview-info   save generation settings for previews already on disk
 //	moflo -checksum          checksum model files with none on record (slow, once per file)
 //	moflo -checksum-only     checksum every model file and check it against the state file and Civitai
+//	moflo -base pony -checksum-only   only the Pony files (both checksum flags follow -base)
 //	moflo -latest            also fetch the newest version when you hold an older one
 //
 // The config file (~/.config/moflo/config.json) holds every flag's
@@ -98,7 +99,7 @@ import (
 )
 
 const (
-	version       = "2026.10.30-1" // bumped with every build handed out
+	version       = "2026.10.30-2" // bumped with every build handed out
 	userAgent     = "moflo/" + version
 	sizeSlack     = 1024             // bytes; the API reports sizes in KB
 	stallTimeout  = 2 * time.Minute  // abort a download that stops sending data
@@ -619,9 +620,9 @@ func (s *stateFile) record(idx *index, path, sha string) {
 
 // syncState lines the state up with the files on disk, then checksums the
 // model files that need it: by default only those new or changed since the
-// last run, and every one not yet checksummed when all is set. The first run
-// only records what is there.
-func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
+// last run, and every one not yet checksummed when all is set (of the base
+// models in bases, unless allBases). The first run only records what is there.
+func syncState(ctx context.Context, idx *index, st *stateFile, all bool, bases map[string]bool, allBases bool) error {
 	seen := map[string]bool{}
 	var todo []localFile
 	var todoBytes int64
@@ -641,7 +642,7 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 			e = ne
 			st.Files[rel] = e
 		}
-		if e.SHA256 == "" && all {
+		if e.SHA256 == "" && all && (allBases || inBases(st, idx, l.path, bases, nil)) {
 			todo = append(todo, l)
 			todoBytes += l.size
 		}
@@ -677,6 +678,25 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 	return nil
 }
 
+// inBases says whether a model file is for one of the base models in bases:
+// by the base on record for it, else a tag in its name or folder, else the
+// base of a liked file of the same name (byName: lower-case name -> tag).
+// A file whose base cannot be told is not.
+func inBases(st *stateFile, idx *index, path string, bases map[string]bool, byName map[string]string) bool {
+	if e := st.Files[idx.rel(path)]; e != nil && e.Base != "" {
+		return bases[e.Base]
+	}
+	if carriesTag(path, bases) {
+		return true
+	}
+	for _, name := range []string{strings.ToLower(filepath.Base(path)), untagged(path)} {
+		if t, ok := byName[name]; ok {
+			return bases[t]
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------- -checksum-only
 
 // verifyAll checksums every model file under the models folder, whether it has
@@ -685,7 +705,8 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 // content does not is reported as damaged and its record left alone; every
 // other checksum is recorded. Civitai is asked only when no liked file has
 // the checksum; when it cannot be reached, only the state file is checked.
-func verifyAll(ctx context.Context, c *client, root, statePath string, st *stateFile, maxModels int, dryRun bool) int {
+// Unless allBases, only files of the base models in bases are checked.
+func verifyAll(ctx context.Context, c *client, root, statePath string, st *stateFile, maxModels int, dryRun bool, bases map[string]bool, allBases bool) int {
 	idx, err := buildIndex(root, map[string]bool{statePath: true, statePath + ".tmp": true})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -695,6 +716,7 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 	likedSha := map[string]string{}     // sha256 -> "model / version"
 	likedName := map[string][]apiFile{} // lower-case file name -> liked files
 	likedVer := map[string]apiFile{}    // model name + "\x00" + version name -> its file
+	likedBase := map[string]string{}    // lower-case file name -> base model tag
 	online := true
 	if models, err := c.likedModels(ctx, maxModels); err != nil {
 		fmt.Fprintln(os.Stderr, "note: could not get the liked models:", err)
@@ -707,6 +729,7 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 						likedSha[sha] = m.Name + " / " + v.Name
 						key := strings.ToLower(filepath.Base(f.Name))
 						likedName[key] = append(likedName[key], f)
+						likedBase[key] = baseTag(v.BaseModel)
 					}
 				}
 				if f, ok := modelFile(v); ok {
@@ -718,13 +741,24 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 
 	var files []localFile
 	var total int64
+	skipped := 0
 	for _, l := range idx.all {
-		if isModelFile(l.path) {
-			files = append(files, l)
-			total += l.size
+		if !isModelFile(l.path) {
+			continue
 		}
+		if !allBases && !inBases(st, idx, l.path, bases, likedBase) {
+			skipped++
+			continue
+		}
+		files = append(files, l)
+		total += l.size
 	}
-	fmt.Fprintf(os.Stderr, "Checksumming all %d model file(s), %s (-checksum-only)...\n", len(files), human(total))
+	if allBases {
+		fmt.Fprintf(os.Stderr, "Checksumming all %d model file(s), %s (-checksum-only)...\n", len(files), human(total))
+	} else {
+		fmt.Fprintf(os.Stderr, "Checksumming %d model file(s), %s (-checksum-only, -base %s; %d of other or unknown base models skipped)...\n",
+			len(files), human(total), strings.Join(sortedKeys(bases), ","), skipped)
+	}
 
 	var nOK, nNew, nChanged, nDamaged, nSrcOK, nSrcBad, nSrcUnknown, nSrcUnchecked, nFailed int
 	var problems []string
@@ -3960,9 +3994,11 @@ func run() int {
 	eaAll := flag.Bool("all", false, "with -ea: also do everything a normal run does")
 	checksum := flag.Bool("checksum", false, "checksum every model file that has no checksum on record (slow, once per file).\n"+
 		"Without it, downloads, -local files, and files that could be a liked file or a copy\n"+
-		"of another are checksummed; that is enough to catch copies and tell files apart")
+		"of another are checksummed; that is enough to catch copies and tell files apart.\n"+
+		"With -base, only files of those base models")
 	checksumOnly := flag.Bool("checksum-only", false, "only checksum every model file, even ones with a checksum on record, and check\n"+
-		"each against the state file and Civitai; no downloads, renames or previews")
+		"each against the state file and Civitai; no downloads, renames or previews.\n"+
+		"With -base, only files of those base models")
 	local := flag.Bool("local", false, "also look up model files that are not liked models on Civitai by checksum, so they\n"+
 		"get tagged and previewed too (the first run checksums them all, which is slow)")
 	guess := flag.Bool("guess", false, "tag model files Civitai does not know (your own trainings, files from elsewhere)\n"+
@@ -4160,8 +4196,18 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// -base for this run; without it, the config's choice is read further on.
+	cliBases, cliAll := map[string]bool{}, true
+	if onCLI["base"] {
+		cliBases, cliAll = parseBases(*baseSpec)
+		for t := range cliBases {
+			if t != "" {
+				knownTags[t] = true
+			}
+		}
+	}
 	if *checksumOnly {
-		return verifyAll(ctx, c, root, statePath, st, *maxModels, *dryRun)
+		return verifyAll(ctx, c, root, statePath, st, *maxModels, *dryRun, cliBases, cliAll)
 	}
 
 	user, err := c.whoami(ctx)
@@ -4199,7 +4245,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	if err := syncState(ctx, idx, st, *checksum); err != nil {
+	if err := syncState(ctx, idx, st, *checksum, cliBases, cliAll); err != nil {
 		fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
 		return 130
 	}
@@ -4211,7 +4257,7 @@ func run() int {
 	opt := planOptions{latest: *latest, rename: *rename, previews: *previews,
 		blocked: cfg.blocked(), basePreviews: map[string]int{}, baseLatest: map[string]bool{}}
 	if onCLI["base"] {
-		opt.bases, opt.all = parseBases(*baseSpec)
+		opt.bases, opt.all = cliBases, cliAll
 	} else {
 		opt.bases = cfg.enabled()
 	}
