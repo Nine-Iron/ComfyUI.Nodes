@@ -56,6 +56,7 @@
 //	moflo -previews 4        keep up to 4 preview images per model to choose from
 //	moflo -previews-only -preview-info   save generation settings for previews already on disk
 //	moflo -checksum          checksum model files with none on record (slow, once per file)
+//	moflo -checksum-only     checksum every model file and check it against the state file and Civitai
 //	moflo -latest            also fetch the newest version when you hold an older one
 //
 // The config file (~/.config/moflo/config.json) holds every flag's
@@ -97,7 +98,7 @@ import (
 )
 
 const (
-	version       = "2026.10.18-3" // bumped with every build handed out
+	version       = "2026.10.30-1" // bumped with every build handed out
 	userAgent     = "moflo/" + version
 	sizeSlack     = 1024             // bytes; the API reports sizes in KB
 	stallTimeout  = 2 * time.Minute  // abort a download that stops sending data
@@ -674,6 +675,164 @@ func syncState(ctx context.Context, idx *index, st *stateFile, all bool) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------- -checksum-only
+
+// verifyAll checksums every model file under the models folder, whether it has
+// a checksum on record or not, and holds each one against the state file and
+// against Civitai. A file whose size and time match the record but whose
+// content does not is reported as damaged and its record left alone; every
+// other checksum is recorded. Civitai is asked only when no liked file has
+// the checksum; when it cannot be reached, only the state file is checked.
+func verifyAll(ctx context.Context, c *client, root, statePath string, st *stateFile, maxModels int, dryRun bool) int {
+	idx, err := buildIndex(root, map[string]bool{statePath: true, statePath + ".tmp": true})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	// What Civitai says the liked files are, to check against without asking per file.
+	likedSha := map[string]string{}     // sha256 -> "model / version"
+	likedName := map[string][]apiFile{} // lower-case file name -> liked files
+	likedVer := map[string]apiFile{}    // model name + "\x00" + version name -> its file
+	online := true
+	if models, err := c.likedModels(ctx, maxModels); err != nil {
+		fmt.Fprintln(os.Stderr, "note: could not get the liked models:", err)
+		fmt.Fprintln(os.Stderr, "      files are checked against Civitai by checksum lookup only")
+	} else {
+		for _, m := range models {
+			for _, v := range m.ModelVersions {
+				for _, f := range v.Files {
+					if sha := f.sha256(); sha != "" {
+						likedSha[sha] = m.Name + " / " + v.Name
+						key := strings.ToLower(filepath.Base(f.Name))
+						likedName[key] = append(likedName[key], f)
+					}
+				}
+				if f, ok := modelFile(v); ok {
+					likedVer[m.Name+"\x00"+v.Name] = f
+				}
+			}
+		}
+	}
+
+	var files []localFile
+	var total int64
+	for _, l := range idx.all {
+		if isModelFile(l.path) {
+			files = append(files, l)
+			total += l.size
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Checksumming all %d model file(s), %s (-checksum-only)...\n", len(files), human(total))
+
+	var nOK, nNew, nChanged, nDamaged, nSrcOK, nSrcBad, nSrcUnknown, nSrcUnchecked, nFailed int
+	var problems []string
+	for i, l := range files {
+		rel := idx.rel(l.path)
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s (%s)\n", i+1, len(files), rel, human(l.size))
+		sum, err := hashFile(ctx, l.path)
+		if err != nil {
+			if ctx.Err() != nil {
+				if !dryRun {
+					st.saveOrWarn()
+				}
+				fmt.Fprintln(os.Stderr, "\nInterrupted. Checksums done so far are saved.")
+				return 130
+			}
+			nFailed++
+			problems = append(problems, fmt.Sprintf("%s: could not read it: %v", rel, err))
+			continue
+		}
+
+		// File vs state file.
+		e := st.Files[rel]
+		damaged := false
+		var db string
+		switch {
+		case e == nil || e.SHA256 == "":
+			nNew++
+			db = "db: none on record"
+		case e.SHA256 == sum:
+			nOK++
+			db = "db: ok"
+		case e.Size != l.size || e.MTime != l.mtime:
+			nChanged++
+			db = "db: file changed since recorded"
+		default:
+			nDamaged++
+			damaged = true
+			db = "db: DIFFERENT, same size and time as recorded (damaged?)"
+			problems = append(problems, fmt.Sprintf("%s: checksum %s, but %s on record for the same size and time", rel, sum, e.SHA256))
+		}
+
+		// File vs Civitai.
+		var src string
+		if what, ok := likedSha[sum]; ok {
+			nSrcOK++
+			src = "civitai: ok (" + what + ")"
+		} else if !online {
+			nSrcUnchecked++
+			src = "civitai: not checked (offline)"
+		} else if v, err := c.versionByHash(ctx, sum); err != nil {
+			online = false // one failure is enough to stop asking for the rest
+			nSrcUnchecked++
+			src = "civitai: not checked (" + err.Error() + ")"
+			fmt.Fprintln(os.Stderr, "  note: Civitai lookup failed; not asking about the remaining files:", err)
+		} else if v != nil {
+			nSrcOK++
+			src = "civitai: ok (" + v.Model.Name + " / " + v.Name + ")"
+		} else {
+			// Civitai does not know this checksum. Is it a file we know it should be?
+			var want []string
+			if e != nil && e.Model != "" {
+				if f, ok := likedVer[e.Model+"\x00"+e.Version]; ok && f.sha256() != "" {
+					want = append(want, f.sha256())
+				}
+			}
+			if len(want) == 0 {
+				for _, name := range []string{strings.ToLower(filepath.Base(l.path)), untagged(l.path)} {
+					for _, f := range likedName[name] {
+						if !slices.Contains(want, f.sha256()) {
+							want = append(want, f.sha256())
+						}
+					}
+				}
+			}
+			if len(want) > 0 {
+				nSrcBad++
+				src = "civitai: DIFFERENT from the liked file it should be"
+				problems = append(problems, fmt.Sprintf("%s: checksum %s, Civitai has %s for it", rel, sum, strings.Join(want, " or ")))
+			} else {
+				nSrcUnknown++
+				src = "civitai: unknown there"
+			}
+		}
+		fmt.Fprintf(os.Stderr, "        %s; %s\n", db, src)
+
+		if !damaged && !dryRun {
+			st.record(idx, l.path, sum)
+			st.saveOrWarn()
+		}
+	}
+
+	fmt.Printf("\nChecked %d model file(s), %s.\n", len(files), human(total))
+	fmt.Printf("  against the state file: %d ok, %d new, %d changed since recorded, %d damaged\n", nOK, nNew, nChanged, nDamaged)
+	fmt.Printf("  against Civitai:        %d ok, %d different, %d unknown there, %d not checked\n", nSrcOK, nSrcBad, nSrcUnknown, nSrcUnchecked)
+	if nFailed > 0 {
+		fmt.Printf("  %d could not be read\n", nFailed)
+	}
+	if dryRun {
+		fmt.Println("  (-n: nothing recorded)")
+	}
+	if len(problems) > 0 {
+		fmt.Println("\nProblems:")
+		for _, p := range problems {
+			fmt.Println("  " + p)
+		}
+		return 1
+	}
+	return 0
 }
 
 // ------------------------------------------------------------- one run only
@@ -3112,7 +3271,7 @@ type config struct {
 }
 
 // Flags that are not settings: they steer the config itself.
-var notSettings = map[string]bool{"config": true, "print-config": true, "set-conf": true, "reconfig": true, "base": true, "version": true}
+var notSettings = map[string]bool{"config": true, "print-config": true, "set-conf": true, "reconfig": true, "base": true, "version": true, "checksum-only": true}
 
 var configAbout = []string{
 	"moFlo config. Flags on the command line win for that run; add -set-conf to save them here.",
@@ -3802,6 +3961,8 @@ func run() int {
 	checksum := flag.Bool("checksum", false, "checksum every model file that has no checksum on record (slow, once per file).\n"+
 		"Without it, downloads, -local files, and files that could be a liked file or a copy\n"+
 		"of another are checksummed; that is enough to catch copies and tell files apart")
+	checksumOnly := flag.Bool("checksum-only", false, "only checksum every model file, even ones with a checksum on record, and check\n"+
+		"each against the state file and Civitai; no downloads, renames or previews")
 	local := flag.Bool("local", false, "also look up model files that are not liked models on Civitai by checksum, so they\n"+
 		"get tagged and previewed too (the first run checksums them all, which is slow)")
 	guess := flag.Bool("guess", false, "tag model files Civitai does not know (your own trainings, files from elsewhere)\n"+
@@ -3913,6 +4074,10 @@ func run() int {
 		*eaAll = false
 	}
 	eaOnly := *eaRetry && !*eaAll
+	if *checksumOnly && (*renameOnly || *previewsOnly || *eaRetry) {
+		fmt.Fprintln(os.Stderr, "-checksum-only does not go together with -rename-only, -previews-only or -ea")
+		return 2
+	}
 	if *renameOnly {
 		if *previewsOnly || *eaRetry {
 			fmt.Fprintln(os.Stderr, "-rename-only does not go together with -previews-only or -ea")
@@ -3994,6 +4159,9 @@ func run() int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
+	}
+	if *checksumOnly {
+		return verifyAll(ctx, c, root, statePath, st, *maxModels, *dryRun)
 	}
 
 	user, err := c.whoami(ctx)

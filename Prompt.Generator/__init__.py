@@ -185,6 +185,9 @@ class RandomPromptTemplate:
                 "prefix": ("STRING", {"default": "", "dynamicPrompts": False}),
                 "suffix": ("STRING", {"default": "", "dynamicPrompts": False}),
             },
+            # SaveImage writes every key of this dict into the PNG, so the
+            # finished prompt travels with the image, not just the seed.
+            "hidden": {"extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -193,7 +196,7 @@ class RandomPromptTemplate:
     CATEGORY = "prompt"
     DESCRIPTION = "Builds a random prompt from a template and wildcard word lists."
 
-    def run(self, theme, template, seed, prefix="", suffix=""):
+    def run(self, theme, template, seed, prefix="", suffix="", extra_pnginfo=None):
         rng = random.Random(seed)
         parts = []
         if theme == "random":
@@ -209,6 +212,8 @@ class RandomPromptTemplate:
         if missing:
             print(f"[Prompt Generator] wildcard(s) not found, used the name instead: {', '.join(sorted(missing))}")
         out = ", ".join(p for p in (expand(prefix, rng, missing), body, expand(suffix, rng, missing)) if p)
+        if isinstance(extra_pnginfo, dict):
+            extra_pnginfo["generated_prompt"] = out
         return (out,)
 
 
