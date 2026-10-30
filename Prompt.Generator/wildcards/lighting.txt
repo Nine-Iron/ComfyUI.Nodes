@@ -10,25 +10,3 @@ blue hour
 backlit silhouette
 studio softbox lighting
 bioluminescent glow
-dappled sunlight through leaves
-firelight
-lantern light
-dramatic chiaroscuro
-soft window light
-harsh fluorescent light
-cold moonlit shadows
-sunrise glow
-stormy twilight
-aurora light
-underwater caustics
-spotlight from above
-rim light and fog
-glowing embers
-light through stained glass
-diffused foggy light
-streetlight glow
-lightning flash
-hard noon shadows
-red emergency lighting
-crepuscular rays
-cinematic three-point lighting

@@ -7,27 +7,3 @@ telephoto compression
 shallow depth of field
 symmetrical composition
 dutch angle
-eye-level shot
-bird's-eye view
-worm's-eye view
-extreme close-up
-medium shot
-full body shot
-establishing shot
-rule of thirds composition
-leading lines
-fisheye lens
-85mm portrait lens
-24mm wide lens
-macro lens
-long exposure
-motion blur
-bokeh background
-framed through a doorway
-reflection in a puddle
-silhouetted foreground
-centered composition
-panoramic view
-tracking shot
-handheld snapshot
-drone shot

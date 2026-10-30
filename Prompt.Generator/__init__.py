@@ -51,37 +51,13 @@ WILDCARD_DIRS = [
 
 # ------------------------------------------------------------------ templates
 
-# Each theme mixes its own lists (wildcards/<theme>/) with the shared ones.
-# {x|} clauses are optional, so prompts vary in length as well as content.
 THEMES = {
-    "scene": "{__style__ of __subject__ __setting__|__subject__ __setting__, __style__"
-             "|__mood__ __style__ of __subject__ __setting__}, "
-             "{__lighting__|__weather__, __lighting__}, __camera__, __color__{, __quality__|}",
-    "portrait": "{__portrait/style__ of __portrait/subject__|__portrait/subject__, __portrait/style__}, "
-                "__portrait/expression__, __portrait/framing__, __lighting__{, __color__|}{, __mood__ atmosphere|}",
-    "landscape": "{__landscape/style__ of __landscape/terrain__ with __landscape/feature__ __landscape/time__"
-                 "|__landscape/terrain__ __landscape/time__, __landscape/feature__ in the distance, __landscape/style__"
-                 "|{a vast|a quiet|a dramatic|a sweeping} view of __landscape/terrain__, __landscape/feature__, __landscape/style__}, "
-                 "{__weather__|__lighting__|__weather__, __lighting__}{, __color__|}",
-    "fantasy": "{__fantasy/flavor__ __fantasy/style__ of __fantasy/subject__ __fantasy/setting__"
-               "|__fantasy/subject__ __fantasy/setting__, __fantasy/flavor__ __fantasy/style__}, "
-               "__fantasy/magic__{, __lighting__|}{, __mood__|}{, __color__|}",
-    "dark fantasy": "{__dark-fantasy/style__ of __dark-fantasy/subject__ __dark-fantasy/setting__"
-                    "|__dark-fantasy/subject__ __dark-fantasy/setting__, __dark-fantasy/style__}, "
-                    "__dark-fantasy/omen__, {ominous|haunting|foreboding|grim|desolate} atmosphere, "
-                    "{dramatic chiaroscuro|cold moonlit shadows|flickering torchlight|sickly green light|__lighting__}"
-                    "{, desaturated colors|, crimson and black|}{, __weather__|}",
-    "sci-fi": "{__sci-fi/style__ of __sci-fi/subject__ __sci-fi/setting__|__sci-fi/subject__ __sci-fi/setting__, __sci-fi/style__}, "
-              "{__sci-fi/cosmic__|__sci-fi/cosmic__|__sci-fi/cosmic__, __sci-fi/tech__|__sci-fi/tech__}, "
-              "{cold starlight|rim lighting|harsh unfiltered sunlight|glowing console light|volumetric light|__lighting__}"
-              "{, __color__|}{, __camera__|}",
-    "cyberpunk": "{__cyberpunk/style__ of __cyberpunk/subject__ __cyberpunk/setting__"
-                 "|__cyberpunk/subject__ __cyberpunk/setting__, __cyberpunk/style__}, "
-                 "__cyberpunk/tech__, __cyberpunk/atmosphere__, "
-                 "{neon glow|neon pink and cyan lighting|red emergency lighting|harsh fluorescent light|holographic glow}"
-                 "{, __camera__|}{, {tense|gritty|lonely|chaotic|melancholic} mood|}",
-    "photo": "{__photo/style__ of __photo/subject__ __photo/setting__|__photo/subject__ __photo/setting__, __photo/style__}, "
-             "{__weather__, |}__lighting__, __photo/film__{, __camera__|}",
+    "scene": "{__style__|__style__, __mood__} of __subject__ __setting__, __lighting__, __camera__, __color__",
+    "portrait": "__style__, portrait of __subject__, __lighting__, {close-up|shallow depth of field}, __mood__ atmosphere",
+    "landscape": "__style__, a {vast|quiet|dramatic} landscape __setting__, __weather__, __lighting__, __color__",
+    "fantasy": "{epic|whimsical|dark} fantasy art, __subject__ __setting__, {glowing runes|floating lights|ancient magic}, __lighting__, __mood__",
+    "sci-fi": "{retro-futuristic|cyberpunk|hard sci-fi} illustration, __subject__ __setting__, __lighting__, __color__, __camera__",
+    "photo": "{35mm film photo|cinematic photograph|candid photograph}, __subject__ __setting__, __weather__, __lighting__, __camera__",
 }
 THEME_NAMES = ["random"] + list(THEMES) + ["custom (use template)"]
 
@@ -185,9 +161,6 @@ class RandomPromptTemplate:
                 "prefix": ("STRING", {"default": "", "dynamicPrompts": False}),
                 "suffix": ("STRING", {"default": "", "dynamicPrompts": False}),
             },
-            # SaveImage writes every key of this dict into the PNG, so the
-            # finished prompt travels with the image, not just the seed.
-            "hidden": {"extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -196,7 +169,7 @@ class RandomPromptTemplate:
     CATEGORY = "prompt"
     DESCRIPTION = "Builds a random prompt from a template and wildcard word lists."
 
-    def run(self, theme, template, seed, prefix="", suffix="", extra_pnginfo=None):
+    def run(self, theme, template, seed, prefix="", suffix=""):
         rng = random.Random(seed)
         parts = []
         if theme == "random":
@@ -212,8 +185,6 @@ class RandomPromptTemplate:
         if missing:
             print(f"[Prompt Generator] wildcard(s) not found, used the name instead: {', '.join(sorted(missing))}")
         out = ", ".join(p for p in (expand(prefix, rng, missing), body, expand(suffix, rng, missing)) if p)
-        if isinstance(extra_pnginfo, dict):
-            extra_pnginfo["generated_prompt"] = out
         return (out,)
 
 
