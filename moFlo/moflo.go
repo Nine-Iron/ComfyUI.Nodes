@@ -110,21 +110,38 @@ const (
 
 // Civitai model type -> folder under the ComfyUI models directory.
 var typeDirs = map[string]string{
-	"Checkpoint":       "checkpoints",
-	"LORA":             "loras",
-	"LoCon":            "loras",
-	"DoRA":             "loras",
-	"TextualInversion": "embeddings",
-	"VAE":              "vae",
-	"Controlnet":       "controlnet",
-	"Upscaler":         "upscale_models",
-	"Hypernetwork":     "hypernetworks",
-	"MotionModule":     "animatediff_models",
+	"Checkpoint":        "checkpoints",
+	"LORA":              "loras",
+	"LoCon":             "loras",
+	"DoRA":              "loras",
+	"TextualInversion":  "embeddings",
+	"VAE":               "vae",
+	"Controlnet":        "controlnet",
+	"Upscaler":          "upscale_models",
+	"Hypernetwork":      "hypernetworks",
+	"MotionModule":      "animatediff_models",
+	"TextEncoder":       "text_encoders",
+	"Detection":         "ultralytics",
+	"Workflows":         "workflows",
+	"Wildcards":         "wildcards",
+	"Poses":             "poses",
+	"AestheticGradient": "aesthetic_gradients",
+	"Other":             "other",
+}
+
+// typeDir is the folder a Civitai model type goes in; a type moFlo does not
+// know goes in a folder named after it, since Civitai lets it be downloaded.
+func typeDir(t string) string {
+	if dir, ok := typeDirs[t]; ok {
+		return dir
+	}
+	return strings.ToLower(t)
 }
 
 // ---------------------------------------------------------------- API types
 
 type apiFile struct {
+	ID          int64          `json:"id"`
 	Name        string         `json:"name"`
 	Type        string         `json:"type"`
 	SizeKB      float64        `json:"sizeKB"`
@@ -317,6 +334,7 @@ func (c *client) likedModels(ctx context.Context, limit int) ([]apiModel, error)
 	extra, err := c.pageModels(ctx, q, limit)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning: could not list early access versions:", err)
+		c.realNames(ctx, models)
 		return models, nil
 	}
 	byID := map[int64]int{}
@@ -350,7 +368,66 @@ func (c *client) likedModels(ctx context.Context, limit int) ([]apiModel, error)
 			})
 		}
 	}
+	c.realNames(ctx, models)
 	return models, nil
+}
+
+// placeholder says whether Civitai's API gave a made-up name for a file
+// (model_version_<file id>.ext) instead of the name it was uploaded under.
+func placeholder(f apiFile) bool {
+	stem := strings.TrimSuffix(f.Name, filepath.Ext(f.Name))
+	return f.ID != 0 && strings.HasSuffix(stem, "_"+strconv.FormatInt(f.ID, 10))
+}
+
+// pageFile is a file in a model page's data: id, size in KB, "name".
+var pageFile = regexp.MustCompile(`(\d+),([0-9.]+),\\?"([^"\\/]+)\\?"`)
+
+// realNames puts the names files were uploaded under in place of the made-up
+// ones the API gives for some models, from the model's page on Civitai, where
+// they are. A name is taken only when the page has the same file id and size.
+func (c *client) realNames(ctx context.Context, models []apiModel) {
+	for _, m := range models {
+		want := map[int64]*apiFile{}
+		for vi := range m.ModelVersions {
+			for fi := range m.ModelVersions[vi].Files {
+				if f := &m.ModelVersions[vi].Files[fi]; placeholder(*f) {
+					want[f.ID] = f
+				}
+			}
+		}
+		if len(want) == 0 {
+			continue
+		}
+		page, err := c.getPage(ctx, fmt.Sprintf("%s/models/%d", c.base.String(), m.ID))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "note: could not read the file names of %q from its page: %v\n", m.Name, err)
+			continue
+		}
+		for _, g := range pageFile.FindAllStringSubmatch(page, -1) {
+			id, _ := strconv.ParseInt(g[1], 10, 64)
+			kb, _ := strconv.ParseFloat(g[2], 64)
+			if f := want[id]; f != nil && math.Abs(kb-f.SizeKB) < 1 {
+				f.Name = g[3]
+				delete(want, id)
+			}
+		}
+	}
+}
+
+// getPage fetches a Civitai web page as text.
+func (c *client) getPage(ctx context.Context, rawURL string) (string, error) {
+	rctx, cancel := context.WithTimeout(ctx, apiTimeout)
+	defer cancel()
+	resp, err := c.do(rctx, rawURL, nil) // Civitai refuses (403) an Accept: text/html
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", statusError(resp)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	return string(b), err
 }
 
 // pageModels follows the cursor through every page of a models query.
@@ -527,10 +604,14 @@ type fileState struct {
 	Title    string   `json:"title,omitempty"`    // the model name without the base model list at its end (shown in ComfyUI)
 	Version  string   `json:"version,omitempty"`  // Civitai version name
 	// What -local learned about a file no liked model accounts for.
-	ModelType    string `json:"modelType,omitempty"`
-	VersionName  string `json:"versionName,omitempty"`
-	VersionID    int64  `json:"versionId,omitempty"`
-	NotOnCivitai bool   `json:"notOnCivitai,omitempty"`
+	ModelType   string `json:"modelType,omitempty"`
+	VersionName string `json:"versionName,omitempty"`
+	VersionID   int64  `json:"versionId,omitempty"`
+	// Civitai's ids for the file, set when it is downloaded or matched:
+	// civitai:ModelID@VersionID+FileID.
+	ModelID      int64 `json:"modelId,omitempty"`
+	FileID       int64 `json:"fileId,omitempty"`
+	NotOnCivitai bool  `json:"notOnCivitai,omitempty"`
 }
 
 // setBase notes which base model a file is for (read by the preview popup).
@@ -541,6 +622,15 @@ func (s *stateFile) setBase(idx *index, path string, it item, baseName string) {
 	}
 	if it.model.Name != "" { // the name ComfyUI shows for it (read by the preview popup)
 		e.Title, e.Version = cleanTitle(it.model.Name), it.ver.Name
+	}
+	if it.model.ID != 0 {
+		e.ModelID, e.ModelType = it.model.ID, it.model.Type
+	}
+	if it.ver.ID != 0 {
+		e.VersionID, e.VersionName = it.ver.ID, it.ver.Name
+	}
+	if it.file.ID != 0 {
+		e.FileID = it.file.ID
 	}
 	if it.tag == "" {
 		return
@@ -577,6 +667,11 @@ func loadState(path string) (*stateFile, error) {
 	}
 	if st.EarlyAccess == nil {
 		st.EarlyAccess = map[string]*eaRecord{}
+	}
+	for _, e := range st.Files { // checksums put there by hand may be upper case
+		if e != nil {
+			e.SHA256 = strings.ToLower(strings.TrimSpace(e.SHA256))
+		}
 	}
 	st.existed = true
 	return st, nil
@@ -699,11 +794,19 @@ func inBases(st *stateFile, idx *index, path string, bases map[string]bool, byNa
 
 // ---------------------------------------------------------- -checksum-only
 
+// fileID is the Civitai file id on record for a file, 0 if none.
+func fileID(e *fileState) int64 {
+	if e == nil {
+		return 0
+	}
+	return e.FileID
+}
+
 // verifyAll checksums every model file under the models folder, whether it has
 // a checksum on record or not, and holds each one against the state file and
 // against Civitai. A file whose size and time match the record but whose
-// content does not is reported as damaged and its record left alone; every
-// other checksum is recorded. Civitai is asked only when no liked file has
+// content does not is reported as damaged. Every checksum is recorded, so the
+// record always says what the bytes are. Civitai is asked only when no liked file has
 // the checksum; when it cannot be reached, only the state file is checked.
 // Unless allBases, only files of the base models in bases are checked.
 func verifyAll(ctx context.Context, c *client, root, statePath string, st *stateFile, maxModels int, dryRun bool, bases map[string]bool, allBases bool) int {
@@ -717,6 +820,7 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 	likedName := map[string][]apiFile{} // lower-case file name -> liked files
 	likedVer := map[string]apiFile{}    // model name + "\x00" + version name -> its file
 	likedBase := map[string]string{}    // lower-case file name -> base model tag
+	likedFile := map[int64]apiFile{}    // Civitai file id -> liked file
 	online := true
 	if models, err := c.likedModels(ctx, maxModels); err != nil {
 		fmt.Fprintln(os.Stderr, "note: could not get the liked models:", err)
@@ -725,6 +829,9 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 		for _, m := range models {
 			for _, v := range m.ModelVersions {
 				for _, f := range v.Files {
+					if f.ID != 0 {
+						likedFile[f.ID] = f
+					}
 					if sha := f.sha256(); sha != "" {
 						likedSha[sha] = m.Name + " / " + v.Name
 						key := strings.ToLower(filepath.Base(f.Name))
@@ -781,7 +888,6 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 
 		// File vs state file.
 		e := st.Files[rel]
-		damaged := false
 		var db string
 		switch {
 		case e == nil || e.SHA256 == "":
@@ -795,7 +901,6 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 			db = "db: file changed since recorded"
 		default:
 			nDamaged++
-			damaged = true
 			db = "db: DIFFERENT, same size and time as recorded (damaged?)"
 			problems = append(problems, fmt.Sprintf("%s: checksum %s, but %s on record for the same size and time", rel, sum, e.SHA256))
 		}
@@ -818,8 +923,12 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 			src = "civitai: ok (" + v.Model.Name + " / " + v.Name + ")"
 		} else {
 			// Civitai does not know this checksum. Is it a file we know it should be?
+			// By the file id on record, else the version, else the name.
 			var want []string
-			if e != nil && e.Model != "" {
+			if f, ok := likedFile[fileID(e)]; ok && f.sha256() != "" {
+				want = append(want, f.sha256())
+			}
+			if len(want) == 0 && e != nil && e.Model != "" {
 				if f, ok := likedVer[e.Model+"\x00"+e.Version]; ok && f.sha256() != "" {
 					want = append(want, f.sha256())
 				}
@@ -833,10 +942,28 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 					}
 				}
 			}
+			// The checksum on record may say what the file should be, whatever its name.
+			var rec *hashVersion
+			if len(want) == 0 && e != nil && e.SHA256 != "" && e.SHA256 != sum {
+				if v, err := c.versionByHash(ctx, e.SHA256); err != nil {
+					online = false
+					fmt.Fprintln(os.Stderr, "  note: Civitai lookup failed; not asking about the remaining files:", err)
+				} else {
+					rec = v
+				}
+			}
 			if len(want) > 0 {
 				nSrcBad++
 				src = "civitai: DIFFERENT from the liked file it should be"
 				problems = append(problems, fmt.Sprintf("%s: checksum %s, Civitai has %s for it", rel, sum, strings.Join(want, " or ")))
+			} else if rec != nil {
+				nSrcBad++
+				src = "civitai: DIFFERENT from " + rec.Model.Name + " / " + rec.Name + " (the checksum on record)"
+				problems = append(problems, fmt.Sprintf("%s: checksum %s, Civitai has %s for it (%s / %s, civitai:%d@%d)",
+					rel, sum, e.SHA256, rec.Model.Name, rec.Name, rec.ModelID, rec.ID))
+			} else if !online {
+				nSrcUnchecked++
+				src = "civitai: not checked (lookup failed)"
 			} else {
 				nSrcUnknown++
 				src = "civitai: unknown there"
@@ -844,7 +971,7 @@ func verifyAll(ctx context.Context, c *client, root, statePath string, st *state
 		}
 		fmt.Fprintf(os.Stderr, "        %s; %s\n", db, src)
 
-		if !damaged && !dryRun {
+		if !dryRun { // what the file's bytes are, whatever they should be
 			st.record(idx, l.path, sum)
 			st.saveOrWarn()
 		}
@@ -1911,6 +2038,10 @@ func sharedNames(models []apiModel) map[string]int {
 	return out
 }
 
+// keepName are the model types whose files workflows load by their exact
+// name (qwen_3_4b_bf16.safetensors), so -name auto never renames them.
+var keepName = map[string]bool{"TextEncoder": true}
+
 // saveName is the name a model file is saved under, and why it is not
 // Civitai's own (empty when it is).
 func saveName(m apiModel, v apiVersion, f apiFile, shared map[string]int) (string, string) {
@@ -1922,6 +2053,8 @@ func saveName(m apiModel, v apiVersion, f apiFile, shared map[string]int) (strin
 		why = "-name model"
 	default:
 		switch {
+		case keepName[m.Type]:
+			return f.Name, ""
 		case genericName(f.Name):
 			why = fmt.Sprintf("Civitai's file name %q says nothing about it", f.Name)
 		case shared[strings.ToLower(f.Name)] > 1:
@@ -2322,13 +2455,37 @@ func modelFile(v apiVersion) (apiFile, bool) {
 	if pick < 0 {
 		return apiFile{}, false
 	}
-	f := v.Files[pick]
+	return cleanFile(v.Files[pick])
+}
+
+// cleanFile makes a file's remote name safe to use as a file name.
+func cleanFile(f apiFile) (apiFile, bool) {
 	// Never trust a remote name as a path.
 	f.Name = filepath.Base(strings.ReplaceAll(strings.TrimSpace(f.Name), `\`, "/"))
 	if f.Name == "" || f.Name == "." || f.Name == ".." || f.Name == "/" || f.DownloadURL == "" {
 		return apiFile{}, false
 	}
 	return f, true
+}
+
+// versionFile picks the file of a version to have: of a version offered in
+// several variants (bf16, fp8...), the one already on disk in dir by its exact
+// size, else the one modelFile picks.
+func versionFile(v apiVersion, idx *index, dir string) (apiFile, bool) {
+	prefix := filepath.Join(idx.root, dir) + string(filepath.Separator)
+	for _, f := range v.Files {
+		if f.Type != "Model" && f.Type != "Pruned Model" || f.bytes() == 0 {
+			continue
+		}
+		for _, l := range idx.all {
+			if strings.HasPrefix(l.path, prefix) && isModelFile(l.path) && sizeExact(l.size, f.bytes()) {
+				if cf, ok := cleanFile(f); ok {
+					return cf, true
+				}
+			}
+		}
+	}
+	return modelFile(v)
 }
 
 func versionLabel(v apiVersion) string {
@@ -2474,18 +2631,13 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 	}
 
 	for _, m := range models {
-		dir, ok := typeDirs[m.Type]
-		if !ok {
-			res.items = append(res.items, item{model: m, status: stSkip,
-				note: fmt.Sprintf("type %q is not a model file ComfyUI loads", m.Type)})
-			continue
-		}
+		dir := typeDir(m.Type)
 		// Group the model's versions by base model, keeping newest-first order.
 		agnostic := baseAgnostic[m.Type]
 		var order []string
 		groups := map[string][]candidate{}
 		for _, v := range m.ModelVersions {
-			f, ok := modelFile(v)
+			f, ok := versionFile(v, idx, dir)
 			if !ok {
 				continue
 			}
@@ -2856,6 +3008,12 @@ func lookupLocal(ctx context.Context, c *client, idx *index, st *stateFile, res 
 		tag, how := "", ""
 		if v != nil {
 			e.VersionID, e.ModelType, e.Model, e.BaseName = v.ID, v.Model.Type, v.Model.Name, strings.TrimSpace(v.BaseModel)
+			e.ModelID = v.ModelID
+			for _, f := range v.Files {
+				if f.sha256() != "" && f.sha256() == e.SHA256 {
+					e.FileID = f.ID
+				}
+			}
 			if v.Name != "" {
 				e.VersionName = v.Name
 			}
@@ -3642,9 +3800,6 @@ type likedBase struct {
 func likedBases(models []apiModel) []likedBase {
 	by := map[string]*likedBase{}
 	for _, m := range models {
-		if _, ok := typeDirs[m.Type]; !ok {
-			continue
-		}
 		seen := map[string]bool{}
 		for _, v := range m.ModelVersions {
 			key, name := noBaseKey, "No base model (upscalers)"
