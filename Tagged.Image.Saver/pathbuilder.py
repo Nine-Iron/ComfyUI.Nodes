@@ -9,7 +9,7 @@ import hashlib
 import re
 from collections import deque
 
-DEFAULT_TEMPLATE = "{workflow}/{date}/{sampler}-{scheduler}/{time}-{lora_names}-{steps}-{cfg}-{denoise}-{seed}"
+DEFAULT_TEMPLATE = "{workflow}/{date}/{model}/{sampler}-{scheduler}/{time}-{lora_names}-{steps}-{cfg}-{denoise}-{seed}"
 
 SEGMENT_BYTE_LIMIT = 200
 MODEL_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft")
