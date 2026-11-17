@@ -414,6 +414,55 @@ func (c *client) realNames(ctx context.Context, models []apiModel) {
 	}
 }
 
+// likedVersions narrows each liked model to the versions the account liked.
+// Civitai's favorites list gives whole models, but a like (thumbs-up review)
+// belongs to one version; the account's reviews of a model say which. A model
+// with no version-level like found keeps all its versions (newest per base).
+func (c *client) likedVersions(ctx context.Context, models []apiModel) {
+	var unsure []string
+	for i := range models {
+		m := &models[i]
+		in, _ := json.Marshal(map[string]any{"json": map[string]any{"modelId": m.ID}})
+		var resp struct {
+			Result struct {
+				Data struct {
+					JSON []struct {
+						ModelVersionID int64 `json:"modelVersionId"`
+						Recommended    bool  `json:"recommended"`
+					} `json:"json"`
+				} `json:"data"`
+			} `json:"result"`
+		}
+		err := c.getJSON(ctx, c.base.String()+"/api/trpc/resourceReview.getUserResourceReview?input="+url.QueryEscape(string(in)), &resp)
+		if ctx.Err() != nil {
+			return
+		}
+		liked := map[int64]bool{}
+		if err == nil {
+			for _, r := range resp.Result.Data.JSON {
+				if r.Recommended {
+					liked[r.ModelVersionID] = true
+				}
+			}
+		}
+		var keep []apiVersion
+		for _, v := range m.ModelVersions {
+			if liked[v.ID] {
+				keep = append(keep, v)
+			}
+		}
+		if len(keep) == 0 {
+			unsure = append(unsure, m.Name)
+			continue
+		}
+		m.ModelVersions = keep
+	}
+	if len(unsure) > 0 {
+		fmt.Fprintf(os.Stderr, "note: no liked version found for %d model(s), so their newest versions are used: %s\n",
+			len(unsure), strings.Join(unsure, "; "))
+	}
+}
+
 // getPage fetches a Civitai web page as text.
 func (c *client) getPage(ctx context.Context, rawURL string) (string, error) {
 	rctx, cancel := context.WithTimeout(ctx, apiTimeout)
@@ -4378,6 +4427,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "could not get the liked models:", err)
 		return 1
 	}
+	c.likedVersions(ctx, models)
 	if !onCLI["base"] { // which base models: from the config, asking about new ones
 		changed, err := cfg.chooseBases(likedBases(models), *reconfig, *yes)
 		if err != nil {
