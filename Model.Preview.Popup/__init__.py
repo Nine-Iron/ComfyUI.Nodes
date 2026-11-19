@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import struct
+import threading
 import zlib
 
 import folder_paths
@@ -84,6 +85,73 @@ def preview_files(model_path):
 
 MAX_TEXT = 20000  # longest prompt passed on; longer ones are cut
 _info_cache = {}  # image path -> (stamp, info)
+_base_cache = {}  # model path -> (mtime, size, (tag, label, source))
+
+# ------------------------------------------------------------ disk cache
+# Generation settings and base models are saved to the user directory, keyed by
+# each file's mtime and size, so they are only worked out again when the file
+# changes, also across restarts.
+CACHE_VERSION = 1
+_cache_lock = threading.Lock()
+_save_timer = None
+
+
+def _cache_path():
+    try:
+        directory = folder_paths.get_user_directory()
+    except Exception:
+        directory = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(directory, "model_preview_popup.cache.json")
+
+
+def _stamp_from_json(v):
+    return tuple(tuple(x) if isinstance(x, list) else None for x in v)
+
+
+def _load_disk_cache():
+    try:
+        with open(_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") != CACHE_VERSION:
+            return
+        for path, (stamp, info) in data.get("info", {}).items():
+            _info_cache[path] = (_stamp_from_json(stamp), info)
+        for path, (mtime, size, result) in data.get("base", {}).items():
+            _base_cache[path] = (mtime, size, tuple(result))
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # a bad cache file is just ignored and rebuilt
+        logging.warning("[Model Preview Popup] ignoring cache file: %s", e)
+
+
+def _save_disk_cache():
+    global _save_timer
+    with _cache_lock:
+        _save_timer = None
+        data = {"version": CACHE_VERSION,
+                "info": {k: [list(v[0]), v[1]] for k, v in list(_info_cache.items())},
+                "base": {k: [v[0], v[1], list(v[2])] for k, v in list(_base_cache.items())}}
+    path = _cache_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as e:
+        logging.warning("[Model Preview Popup] could not save cache: %s", e)
+
+
+def _cache_changed():
+    """Save the cache a few seconds after the last change."""
+    global _save_timer
+    with _cache_lock:
+        if _save_timer is None:
+            _save_timer = threading.Timer(5.0, _save_disk_cache)
+            _save_timer.daemon = True
+            _save_timer.start()
+
+
+_load_disk_cache()
 
 
 def _clean(v):
@@ -561,9 +629,10 @@ def generation_info(image_path):
     except Exception as e:  # odd metadata must never break the popup
         logging.warning("[Model Preview Popup] could not read settings from %s: %s", image_path, e)
         info = None
-    if len(_info_cache) > 2000:
+    if len(_info_cache) > 100000:
         _info_cache.clear()
     _info_cache[image_path] = (stamp, info)
+    _cache_changed()
     return info
 
 
@@ -587,7 +656,6 @@ LABELS = {
 }
 
 _state_cache = {"mtime": None, "map": {}, "titles": {}}
-_base_cache = {}  # path -> (mtime, size, (tag, label, source))
 
 
 def _state_bases():
@@ -706,6 +774,7 @@ def base_of(path):
         tag, source = "unknown", "none"
     result = (tag, LABELS.get(tag, tag), source)
     _base_cache[path] = (st.st_mtime, st.st_size, result)
+    _cache_changed()
     return result
 
 
@@ -727,7 +796,27 @@ def all_bases():
     return {"folders": folders, "labels": labels}
 
 
+def list_response(path, lite):
+    """What /list returns for one model. lite: only the picture names and title."""
+    images = preview_files(path)
+    title, version = civitai_title(path)
+    out = {"found": True, "images": images, "title": title, "version": version}
+    if lite:
+        return out
+    tag, label, source = base_of(path)
+    directory = os.path.dirname(path)
+    info = {}
+    for name in images:  # generation settings of each picture, where known
+        gi = generation_info(os.path.join(directory, name))
+        if gi:
+            info[name] = gi
+    out.update(info=info, base=tag, baseLabel=label, baseSource=source)
+    return out
+
+
 try:
+    import asyncio
+
     from aiohttp import web
     from server import PromptServer
 
@@ -737,32 +826,24 @@ try:
     async def _list(request):
         folder = request.query.get("folder", "")
         filename = request.query.get("filename", "")
-        path = _resolve(folder, filename)
+        lite = request.query.get("lite") == "1"
+        # File reading happens on a worker thread so the server stays responsive.
+        path = await asyncio.to_thread(_resolve, folder, filename)
         if not path:
             return web.json_response({"found": False, "images": []})
-        tag, label, source = base_of(path)
-        images = preview_files(path)
-        directory = os.path.dirname(path)
-        info = {}
-        for name in images:  # generation settings of each picture, where known
-            gi = generation_info(os.path.join(directory, name))
-            if gi:
-                info[name] = gi
-        title, version = civitai_title(path)
-        return web.json_response({"found": True, "images": images, "info": info, "title": title, "version": version,
-                                  "base": tag, "baseLabel": label, "baseSource": source})
+        return web.json_response(await asyncio.to_thread(list_response, path, lite))
 
     @routes.get("/Model.Preview.Popup/bases")
     async def _bases(request):
-        return web.json_response(all_bases())
+        return web.json_response(await asyncio.to_thread(all_bases))
 
     @routes.get("/Model.Preview.Popup/image")
     async def _image(request):
         folder = request.query.get("folder", "")
         filename = request.query.get("filename", "")
         name = request.query.get("name", "")
-        path = _resolve(folder, filename)
-        if not path or name not in preview_files(path):  # only listed previews, never other files
+        path = await asyncio.to_thread(_resolve, folder, filename)
+        if not path or name not in await asyncio.to_thread(preview_files, path):  # only listed previews, never other files
             return web.Response(status=404)
         resp = web.FileResponse(os.path.join(os.path.dirname(path), name))
         resp.headers["Cache-Control"] = "no-cache"

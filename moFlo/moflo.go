@@ -2450,6 +2450,10 @@ type planOptions struct {
 	rename   bool
 	previews int
 	unsure   map[string]bool // files that fit several liked files by name and size, with no checksum
+	// offPreviews: liked files already on disk whose base model is switched
+	// off in the config still get their missing previews (no download, no
+	// rename). Not when -base was given: then only those bases are touched.
+	offPreviews bool
 	// From the config file:
 	blocked      map[string]bool // modelKey -> "download": false for that base
 	basePreviews map[string]int  // base tag -> previews for it
@@ -2718,8 +2722,15 @@ func plan(c *client, idx *index, st *stateFile, models []apiModel, opt planOptio
 		}
 		for _, tag := range order {
 			if !agnostic && !opt.all && !opt.bases[tag] {
-				res.others[tag]++ // not handled at all this run
+				res.others[tag]++ // not downloaded or renamed this run
 				res.off = append(res.off, item{model: m, ver: groups[tag][0].ver, tag: tag, status: stOff})
+				if opt.offPreviews {
+					if it := evaluate(m, dir, groups[tag]); it.status == stHave {
+						it.rename = "" // its base is switched off: previews only
+						it.note = joinNote(it.note, "base model switched off in the config; previews only")
+						res.items = append(res.items, it)
+					}
+				}
 				continue
 			}
 			res.matched[tag] = true
@@ -4465,6 +4476,7 @@ func run() int {
 		opt.bases, opt.all = cliBases, cliAll
 	} else {
 		opt.bases = cfg.enabled()
+		opt.offPreviews = true
 	}
 	for k, b := range cfg.Bases { // per base model settings, unless the flag was given for this run
 		if b.Previews != nil && !onCLI["previews"] && !*renameOnly {

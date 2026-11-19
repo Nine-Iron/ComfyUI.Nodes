@@ -74,7 +74,8 @@ const STYLE = `
 .mpp-extras img.is-current { border-color: var(--p-primary-color, #3b82f6); opacity: 1; }
 .mpp-meta { margin-top: 8px; color: var(--descrip-text, #aaa); overflow-wrap: anywhere; }
 .mpp-meta b { color: var(--fg-color, #ddd); font-weight: 600; }
-body.mpp-showing .model-lib-model-preview { display: none !important; }
+body.mpp-showing .model-lib-model-preview,
+body.mpp-showing .model-lib-tree-explorer [data-testid="tree-item-preview"] { display: none !important; }
 .mpp-dialog-back { position: fixed; inset: 0; z-index: 10001; background: rgba(0,0,0,.45);
   display: flex; align-items: center; justify-content: center; }
 .mpp-dialog { width: 380px; max-width: calc(100vw - 32px); max-height: calc(100vh - 64px); display: flex; flex-direction: column;
@@ -92,22 +93,72 @@ body.mpp-showing .model-lib-model-preview { display: none !important; }
 `;
 
 const LIST_TTL = 30000; // re-check the folder after this, so new preview files show up
-const listCache = new Map(); // "folder/filename" -> { at, promise }
-const metaCache = new Map();
+const listCache = new Map(); // "F:folder/filename" (full) or "L:..." (lite) -> { at, promise }
+const metaCache = new Map(); // "folder/filename" -> promise of patched metadata
 
-function previewsFor(folder, filename) {
+// --- request priority ----------------------------------------------------------
+// The Model Library loads metadata for every visible model at once (hundreds when
+// a folder opens). Those go through a small background queue; while a model is
+// hovered the queue pauses, and the hovered model's own job jumps the line.
+const BG_LIMIT = 3;
+const bgQueue = [];          // jobs not started yet
+const bgPending = new Map(); // key -> queued job
+let bgActive = 0;
+let holds = 0;               // > 0 while the popup is loading something
+
+function pump() {
+  while (!holds && bgActive < BG_LIMIT && bgQueue.length) {
+    const job = bgQueue.shift();
+    bgPending.delete(job.key);
+    bgActive++;
+    job.run().then(job.resolve, job.reject).finally(() => { bgActive--; pump(); });
+  }
+}
+
+function background(key, run) {
+  let job;
+  const promise = new Promise((resolve, reject) => { job = { key, run, resolve, reject }; });
+  bgQueue.push(job);
+  bgPending.set(key, job);
+  pump();
+  return promise;
+}
+
+function hold() {
+  holds++;
+  let done = false;
+  return () => { if (!done) { done = true; holds--; pump(); } };
+}
+
+// Run a queued background job right now (the user is pointing at that model).
+function promote(key) {
+  const job = bgPending.get(key);
+  if (!job) return;
+  bgPending.delete(key);
+  bgQueue.splice(bgQueue.indexOf(job), 1);
+  const release = hold();
+  job.run().then(job.resolve, job.reject).finally(release);
+}
+
+// lite: only the file list and title (what the sidebar needs), no generation
+// settings or base model; cheap for the server.
+function previewsFor(folder, filename, lite = false) {
   const key = `${folder}/${filename}`;
-  const hit = listCache.get(key);
+  const full = listCache.get(`F:${key}`);
+  if (full && Date.now() - full.at < LIST_TTL) return full.promise;
+  const ck = `${lite ? "L" : "F"}:${key}`;
+  const hit = listCache.get(ck);
   if (hit && Date.now() - hit.at < LIST_TTL) return hit.promise;
   const q = new URLSearchParams({ folder, filename });
+  if (lite) q.set("lite", "1");
   const promise = api.fetchApi(`/Model.Preview.Popup/list?${q}`)
     .then((r) => (r.ok ? r.json() : {}))
     .then((d) => ({ images: Array.isArray(d.images) ? d.images : [], base: d.base || "unknown",
                     title: typeof d.title === "string" ? d.title : "", version: typeof d.version === "string" ? d.version : "",
                     info: d.info && typeof d.info === "object" ? d.info : {},
                     baseLabel: d.baseLabel || "Unknown", baseSource: d.baseSource || "none" }))
-    .catch(() => { listCache.delete(key); return { images: [], info: {}, title: "", version: "", base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
-  listCache.set(key, { at: Date.now(), promise });
+    .catch(() => { listCache.delete(ck); return { images: [], info: {}, title: "", version: "", base: "unknown", baseLabel: "Unknown", baseSource: "none" }; });
+  listCache.set(ck, { at: Date.now(), promise });
   return promise;
 }
 
@@ -132,35 +183,46 @@ function genericTitle(t) {
   return words.join("").replace(/[^a-z]/g, "").length <= 5;
 }
 
-function patchMetadata() {
-  const original = api.viewMetadata?.bind(api);
-  if (!original || api.viewMetadata.__mpp) return;
-  const patched = async (folder, filename, ...rest) => {
-    const meta = await original(folder, filename, ...rest);
-    const info = await previewsFor(folder, filename);
-    const copy = meta && typeof meta === "object" ? { ...meta } : {};
-    const had = TITLE_KEYS.map((k) => copy[k]).find((v) => typeof v === "string" && v.trim()) || "";
-    let title = info.title || "";
-    if (!title && had && genericTitle(had)) title = filename.split("/").pop().replace(/\.[^.]+$/, "");
-    if (title && title !== had) {
-      if (had) copy["mpp.trainerTitle"] = had;
-      copy["modelspec.title"] = title;
-      delete copy.title;
-    }
-    if (info.images.length) for (const k of THUMB_KEYS) delete copy[k];
-    if (!meta && !Object.keys(copy).length) return meta;
-    return copy;
-  };
-  patched.__mpp = true;
-  api.viewMetadata = patched;
+let originalViewMetadata = null;
+
+async function fetchMeta(folder, filename, rest) {
+  const [meta, info] = await Promise.all([
+    originalViewMetadata(folder, filename, ...rest),
+    previewsFor(folder, filename, true)]);
+  const copy = meta && typeof meta === "object" ? { ...meta } : {};
+  const had = TITLE_KEYS.map((k) => copy[k]).find((v) => typeof v === "string" && v.trim()) || "";
+  let title = info.title || "";
+  if (!title && had && genericTitle(had)) title = filename.split("/").pop().replace(/\.[^.]+$/, "");
+  if (title && title !== had) {
+    if (had) copy["mpp.trainerTitle"] = had;
+    copy["modelspec.title"] = title;
+    delete copy.title;
+  }
+  if (info.images.length) for (const k of THUMB_KEYS) delete copy[k];
+  if (!meta && !Object.keys(copy).length) return meta;
+  return copy;
 }
 
-async function metadataFor(folder, filename) {
+// Metadata for one model, fetched once per session. The sidebar's requests wait
+// in the background queue; urgent ones (the hovered model) go first.
+function metadataFor(folder, filename, urgent = false, rest = []) {
   const key = `${folder}/${filename}`;
-  if (!metaCache.has(key)) {
-    metaCache.set(key, Promise.resolve(api.viewMetadata?.(folder, filename)).catch(() => null));
+  let p = metaCache.get(key);
+  if (!p) {
+    p = background(key, () => fetchMeta(folder, filename, rest))
+      .catch(() => { metaCache.delete(key); return null; });
+    metaCache.set(key, p);
   }
-  return metaCache.get(key);
+  if (urgent) promote(key);
+  return p;
+}
+
+function patchMetadata() {
+  if (!api.viewMetadata || api.viewMetadata.__mpp) return;
+  originalViewMetadata = api.viewMetadata.bind(api);
+  const patched = (folder, filename, ...rest) => metadataFor(folder, filename, false, rest);
+  patched.__mpp = true;
+  api.viewMetadata = patched;
 }
 
 // --- loading pictures, cancellable -------------------------------------------
@@ -267,6 +329,12 @@ const filterNode = (node) => node?.widgets?.forEach(filterCombo);
 
 function refreshLists() {
   // Reload the Model Library so it re-reads the (filtered) lists.
+  const isRefresh = (b) => /refresh/i.test(b.getAttribute("aria-label") || b.title || "");
+  const tab = document.querySelector(".model-lib-tree-explorer");
+  for (let up = tab?.parentElement; up && up !== document.body; up = up.parentElement) {
+    const b = [...up.querySelectorAll("button")].find(isRefresh);
+    if (b) { b.click(); app.graph?.setDirtyCanvas(true, true); return; }
+  }
   const btn = [...document.querySelectorAll("button")].find((b) =>
     /refresh/i.test(b.getAttribute("aria-label") || b.title || "") && b.closest("[class*=model], .side-bar-panel, .sidebar-content-container"));
   btn?.click();
@@ -363,7 +431,8 @@ const MAX_IMAGE = () => Math.min(window.innerHeight * 0.52, 520);
 function place() {
   if (!anchor || popup.style.display === "none") return;
   const row = anchor.getBoundingClientRect();
-  const panel = (anchor.closest(".p-tree, [class*=sidebar], .side-bar-panel") || anchor.parentElement).getBoundingClientRect();
+  const panel = (anchor.closest(".side-bar-panel, .sidebar-content-container, [class*=sidebar], [class*=side-bar], .model-lib-tree-explorer, .p-tree")
+    || anchor.parentElement).getBoundingClientRect();
   // Everything but the picture (and the settings column when it sits beside it;
   // in a narrow window it wraps below and counts as chrome).
   const stacked = infoEl.offsetParent && infoEl.offsetTop > stage.offsetTop + 1;
@@ -480,11 +549,19 @@ async function show(leaf, folder, filename) {
   const ctl = new AbortController();
   loadCtl = ctl;
   currentKey = key;
-  const info = await previewsFor(folder, filename);
+  const release = hold(); // background loading waits while this model loads
+  ctl.signal.addEventListener("abort", release);
+  try {
+    await showLoaded(leaf, folder, filename, ctl);
+  } finally {
+    release();
+  }
+}
+
+async function showLoaded(leaf, folder, filename, ctl) {
+  const [info, meta] = await Promise.all([previewsFor(folder, filename), metadataFor(folder, filename, true)]);
   if (ctl.signal.aborted) return; // moved on meanwhile
   const images = info.images;
-  const meta = await metadataFor(folder, filename);
-  if (ctl.signal.aborted) return;
   // No preview files: fall back to a thumbnail embedded in the model, if any.
   const embedded = images.length ? "" : text(meta, "modelspec.thumbnail", "thumbnail", "image", "icon");
 
@@ -574,12 +651,25 @@ async function show(leaf, folder, filename) {
   }
 }
 
-// Model rows carry data-testid="tree-node-root/<folder>/<file path>"; only
-// Model Library rows have the model icon container.
+// Model rows carry data-testid="tree-node-root/<folder>/<file path>".
+// Frontend >= 1.59: the row is a [role=treeitem] inside .model-lib-tree-explorer
+// (data-tree-node-type="node" for models) and the testid sits on its inner
+// .tree-node. Older frontends: the row is a .tree-leaf with the testid itself
+// and a .model-lib-model-icon-container.
 function modelOf(target) {
-  const leaf = target?.closest?.('.tree-leaf[data-testid^="tree-node-root/"]');
-  if (!leaf || !leaf.querySelector(".model-lib-model-icon-container")) return null;
-  const path = leaf.dataset.testid.slice("tree-node-root/".length);
+  if (!target?.closest) return null;
+  let leaf = target.closest('.model-lib-tree-explorer [role="treeitem"]');
+  let tagged = null;
+  if (leaf) {
+    if (leaf.dataset.treeNodeType !== "node") return null;
+    tagged = leaf.querySelector('[data-testid^="tree-node-root/"]');
+  } else {
+    leaf = target.closest('.tree-leaf[data-testid^="tree-node-root/"]');
+    if (!leaf || !leaf.querySelector(".model-lib-model-icon-container")) return null;
+    tagged = leaf;
+  }
+  if (!tagged) return null;
+  const path = tagged.dataset.testid.slice("tree-node-root/".length);
   const slash = path.indexOf("/");
   if (slash <= 0 || slash === path.length - 1) return null;
   return { leaf, folder: path.slice(0, slash), filename: path.slice(slash + 1) };
