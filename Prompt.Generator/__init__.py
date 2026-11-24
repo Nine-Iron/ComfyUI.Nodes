@@ -27,6 +27,10 @@ LLM Prompt
         ANTHROPIC_KEY_HOSTS / OPENAI_KEY_HOSTS / OPENAI_COMPATIBLE_KEY_HOSTS
         or keys.json  {"key_hosts": {"openai_compatible": ["openrouter.ai"]}}
 
+Metadata: both nodes write the text they produced into the saved image's
+"prompt" metadata, as _meta.generated_prompt on their own node entry (any
+save node; cache keys are unaffected because _meta is not part of them).
+
 Install: copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 No dependencies beyond ComfyUI itself.
 """
@@ -48,6 +52,47 @@ WILDCARD_DIRS = [
     os.path.join(folder_paths.models_dir, "wildcards"),
     os.path.join(HERE, "wildcards"),
 ]
+
+# ------------------------------------------------------------------- metadata
+# The API prompt dict handed to hidden "PROMPT" inputs is the same object every
+# save node writes into the PNG, so text placed in a node's _meta ends up in the
+# image. _meta (unlike "inputs") is not part of ComfyUI's cache signature.
+
+_last = {}  # node id -> (inputs signature, generated text)
+
+
+def _inputs_sig(node):
+    return json.dumps(node.get("inputs") or {}, sort_keys=True, default=str)
+
+
+def _record(prompt, unique_id, text):
+    if not isinstance(prompt, dict) or unique_id is None:
+        return
+    node = prompt.get(str(unique_id))
+    if not isinstance(node, dict):
+        return
+    meta = node.get("_meta")
+    if not isinstance(meta, dict):
+        meta = node["_meta"] = {}
+    meta["generated_prompt"] = text
+    _last[str(unique_id)] = (_inputs_sig(node), text)
+
+
+def _on_prompt(json_data):
+    """A cached generator node does not run again; restore its last text from memory."""
+    prompt = json_data.get("prompt") if isinstance(json_data, dict) else None
+    if isinstance(prompt, dict):
+        for nid, node in prompt.items():
+            if not isinstance(node, dict) or node.get("class_type") not in NODE_CLASS_MAPPINGS:
+                continue
+            hit = _last.get(str(nid))
+            if hit and hit[0] == _inputs_sig(node):
+                meta = node.get("_meta")
+                if not isinstance(meta, dict):
+                    meta = node["_meta"] = {}
+                meta["generated_prompt"] = hit[1]
+    return json_data
+
 
 # ------------------------------------------------------------------ templates
 
@@ -161,6 +206,7 @@ class RandomPromptTemplate:
                 "prefix": ("STRING", {"default": "", "dynamicPrompts": False}),
                 "suffix": ("STRING", {"default": "", "dynamicPrompts": False}),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -169,7 +215,7 @@ class RandomPromptTemplate:
     CATEGORY = "prompt"
     DESCRIPTION = "Builds a random prompt from a template and wildcard word lists."
 
-    def run(self, theme, template, seed, prefix="", suffix=""):
+    def run(self, theme, template, seed, prefix="", suffix="", prompt=None, unique_id=None):
         rng = random.Random(seed)
         parts = []
         if theme == "random":
@@ -185,6 +231,7 @@ class RandomPromptTemplate:
         if missing:
             print(f"[Prompt Generator] wildcard(s) not found, used the name instead: {', '.join(sorted(missing))}")
         out = ", ".join(p for p in (expand(prefix, rng, missing), body, expand(suffix, rng, missing)) if p)
+        _record(prompt, unique_id, out)
         return (out,)
 
 
@@ -372,6 +419,7 @@ class LLMPrompt:
                                            "tooltip": "A prompt to rewrite and enrich, e.g. from "
                                                       "Random Prompt (Template)."}),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("STRING",)
@@ -380,7 +428,8 @@ class LLMPrompt:
     CATEGORY = "prompt"
     DESCRIPTION = "Has a language model (Claude, ChatGPT, or a local/compatible server) write an image prompt."
 
-    def run(self, provider, model, base_url, idea, style, temperature, max_tokens, seed, timeout, seed_prompt=None):
+    def run(self, provider, model, base_url, idea, style, temperature, max_tokens, seed, timeout, seed_prompt=None,
+            prompt=None, unique_id=None):
         system = SYSTEM.format(style=STYLES[style])
         asks = []
         if seed_prompt and seed_prompt.strip():
@@ -396,8 +445,16 @@ class LLMPrompt:
                          temperature, max_tokens, seed, timeout))
         if not text:
             raise RuntimeError("The model returned an empty prompt.")
+        _record(prompt, unique_id, text)
         return (text,)
 
 
 NODE_CLASS_MAPPINGS = {"RandomPromptTemplate": RandomPromptTemplate, "LLMPrompt": LLMPrompt}
 NODE_DISPLAY_NAME_MAPPINGS = {"RandomPromptTemplate": "Random Prompt (Template)", "LLMPrompt": "LLM Prompt"}
+
+try:
+    from server import PromptServer
+
+    PromptServer.instance.add_on_prompt_handler(_on_prompt)
+except Exception as e:  # no server (tests, scripts): runtime recording still works
+    print(f"[Prompt Generator] metadata restore for cached nodes unavailable: {e}")
