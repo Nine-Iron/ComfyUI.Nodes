@@ -25,6 +25,11 @@ and the pieces are boiled down to their most common words.
 
 max_tags limits how many tags one LoRA shows up front; the rest stay behind
 "+N more". However many triggers a file has, at most three are on by default.
+
+Metadata: the node writes its output into the saved image's "prompt" metadata
+as _meta.final_prompt (the text with tags, as sent to the encoder) and
+_meta.lora_tags on its own node entry. Prompts queued together (Run x N,
+sweeps) and runs where the node was cached get it too.
 """
 
 import json
@@ -32,6 +37,8 @@ import logging
 import os
 import re
 import struct
+import threading
+from collections import deque
 
 import folder_paths
 
@@ -397,6 +404,61 @@ def find_upstream_loras(prompt, unique_id):
     return ordered
 
 
+# -------------------------------------------------------------- metadata
+# The API prompt dict handed to hidden "PROMPT" inputs is the same object every
+# save node writes into the PNG, so values placed in a node's _meta end up in
+# the image (_meta is not part of ComfyUI's cache signature). A cached node does
+# not run, so its last values are restored when a prompt is queued, and queued
+# prompts are remembered so a run of an earlier one fills them in (all prompts
+# of a "Run x N" batch are queued before any runs).
+
+_last = {}     # node id -> (inputs signature, meta values)
+_pending = {}  # node id -> deque of (inputs signature, node dict)
+_meta_lock = threading.Lock()
+
+
+def _inputs_sig(node):
+    return json.dumps(node.get("inputs") or {}, sort_keys=True, default=str)
+
+
+def _set_meta(node, values):
+    meta = node.get("_meta")
+    if not isinstance(meta, dict):
+        meta = node["_meta"] = {}
+    meta.update(values)
+
+
+def _record(prompt, unique_id, values):
+    if not isinstance(prompt, dict) or unique_id is None:
+        return
+    nid = str(unique_id)
+    node = prompt.get(nid)
+    if not isinstance(node, dict):
+        return
+    sig = _inputs_sig(node)
+    with _meta_lock:
+        _set_meta(node, values)
+        _last[nid] = (sig, dict(values))
+        for psig, pnode in _pending.get(nid, ()):
+            if psig == sig:
+                _set_meta(pnode, values)
+
+
+def _on_prompt(json_data):
+    prompt = json_data.get("prompt") if isinstance(json_data, dict) else None
+    if isinstance(prompt, dict):
+        with _meta_lock:
+            for nid, node in prompt.items():
+                if not isinstance(node, dict) or node.get("class_type") not in NODE_CLASS_MAPPINGS:
+                    continue
+                nid, sig = str(nid), _inputs_sig(node)
+                hit = _last.get(nid)
+                if hit and hit[0] == sig:
+                    _set_meta(node, hit[1])
+                _pending.setdefault(nid, deque(maxlen=256)).append((sig, node))
+    return json_data
+
+
 # ------------------------------------------------------------------ node
 
 def _split_tokens(text):
@@ -479,6 +541,7 @@ class LoraTagPicker:
             out = f"{tag_text}, {body}"
         else:
             out = f"{body}, {tag_text}"
+        _record(prompt, unique_id, {"final_prompt": out, "lora_tags": tag_text})
         return (model, clip, out, tag_text)
 
 
@@ -491,6 +554,8 @@ try:
     @PromptServer.instance.routes.get("/Lora.Tag.Picker/tags")
     async def _lora_tag_picker_tags(request):
         return web.json_response(get_lora_info(request.query.get("name", "")))
+
+    PromptServer.instance.add_on_prompt_handler(_on_prompt)
 except Exception as e:  # keep the node usable even if the route can't register
     logging.warning("[LoRA Tag Picker] could not register API route: %s", e)
 

@@ -30,6 +30,8 @@ LLM Prompt
 Metadata: both nodes write the text they produced into the saved image's
 "prompt" metadata, as _meta.generated_prompt on their own node entry (any
 save node; cache keys are unaffected because _meta is not part of them).
+Prompts queued together (Run x N, sweeps) are filled in when the node runs,
+so images whose generator node was cached still carry its text.
 
 Install: copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 No dependencies beyond ComfyUI itself.
@@ -37,6 +39,8 @@ No dependencies beyond ComfyUI itself.
 
 import json
 import os
+import threading
+from collections import deque
 import random
 import re
 import urllib.error
@@ -59,38 +63,54 @@ WILDCARD_DIRS = [
 # image. _meta (unlike "inputs") is not part of ComfyUI's cache signature.
 
 _last = {}  # node id -> (inputs signature, generated text)
+# Node dicts of queued prompts, filled when the node runs. All prompts of a
+# "Run x N" batch are queued before any runs, so the _last restore alone misses
+# every one after the first (their generator node is cached and never runs).
+_pending = {}  # node id -> deque of (inputs signature, node dict)
+_lock = threading.Lock()
 
 
 def _inputs_sig(node):
     return json.dumps(node.get("inputs") or {}, sort_keys=True, default=str)
 
 
-def _record(prompt, unique_id, text):
-    if not isinstance(prompt, dict) or unique_id is None:
-        return
-    node = prompt.get(str(unique_id))
-    if not isinstance(node, dict):
-        return
+def _set_text(node, text):
     meta = node.get("_meta")
     if not isinstance(meta, dict):
         meta = node["_meta"] = {}
     meta["generated_prompt"] = text
-    _last[str(unique_id)] = (_inputs_sig(node), text)
+
+
+def _record(prompt, unique_id, text):
+    if not isinstance(prompt, dict) or unique_id is None:
+        return
+    nid = str(unique_id)
+    node = prompt.get(nid)
+    if not isinstance(node, dict):
+        return
+    sig = _inputs_sig(node)
+    with _lock:
+        _set_text(node, text)
+        _last[nid] = (sig, text)
+        for psig, pnode in _pending.get(nid, ()):
+            if psig == sig:
+                _set_text(pnode, text)
 
 
 def _on_prompt(json_data):
-    """A cached generator node does not run again; restore its last text from memory."""
+    """A cached generator node does not run again: restore its last text now, and
+    remember the node so a later run (of an earlier queued prompt) fills it in."""
     prompt = json_data.get("prompt") if isinstance(json_data, dict) else None
     if isinstance(prompt, dict):
-        for nid, node in prompt.items():
-            if not isinstance(node, dict) or node.get("class_type") not in NODE_CLASS_MAPPINGS:
-                continue
-            hit = _last.get(str(nid))
-            if hit and hit[0] == _inputs_sig(node):
-                meta = node.get("_meta")
-                if not isinstance(meta, dict):
-                    meta = node["_meta"] = {}
-                meta["generated_prompt"] = hit[1]
+        with _lock:
+            for nid, node in prompt.items():
+                if not isinstance(node, dict) or node.get("class_type") not in NODE_CLASS_MAPPINGS:
+                    continue
+                nid, sig = str(nid), _inputs_sig(node)
+                hit = _last.get(nid)
+                if hit and hit[0] == sig:
+                    _set_text(node, hit[1])
+                _pending.setdefault(nid, deque(maxlen=256)).append((sig, node))
     return json_data
 
 
