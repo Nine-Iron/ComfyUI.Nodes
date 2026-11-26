@@ -452,3 +452,135 @@ def build_prefix(prompt, node_id, template=DEFAULT_TEMPLATE, workflow_name="",
             "anchor_class": (prompt.get(anchor) or {}).get("class_type") if anchor != save_id else None,
             "fields": fields, "loras": loras}
     return prefix, info
+
+
+# --- image metadata ------------------------------------------------------
+# Text inputs on an encoder, and inputs a conditioning pass-through node
+# (FluxGuidance, ConditioningCombine, ...) is followed through.
+ENCODER_TEXT_KEYS = ("text", "text_g", "text_l", "t5xxl", "clip_l", "prompt",
+                     "wildcard_text", "populated_text")
+COND_KEYS = ("conditioning", "conditioning_1", "conditioning_2", "conditioning_to",
+             "conditioning_from", "cond", "positive", "negative")
+# Text that generator nodes in this repo record on their own node entry.
+META_TEXT_KEYS = ("final_prompt", "generated_prompt")
+
+
+def _linked_text(prompt, value, depth=0):
+    """A text input's value: literal, a generator's recorded output, or a primitive."""
+    if not is_link(value):
+        value = unwrap(value)
+        return value if isinstance(value, str) else ""
+    if depth > 8:
+        return ""
+    node = prompt.get(str(value[0])) or {}
+    meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+    for key in META_TEXT_KEYS:
+        if isinstance(meta.get(key), str):
+            return meta[key]
+    inputs = node.get("inputs") or {}
+    for key in ("text", "string", "value", "prompt", "populated_text", "wildcard_text"):
+        if key in inputs:
+            got = _linked_text(prompt, inputs[key], depth + 1)
+            if got:
+                return got
+    return ""
+
+
+def _cond_text(prompt, value, depth=0, seen=None):
+    """The prompt text a conditioning input was encoded from."""
+    seen = set() if seen is None else seen
+    if not is_link(value) or depth > 12 or str(value[0]) in seen:
+        return ""
+    nid = str(value[0])
+    seen.add(nid)
+    inputs = (prompt.get(nid) or {}).get("inputs") or {}
+    parts = []
+    for key in ENCODER_TEXT_KEYS:
+        if key in inputs:
+            text = _linked_text(prompt, inputs[key]).strip()
+            if text and text not in parts:
+                parts.append(text)
+    if parts:
+        return "\n".join(parts)
+    for key in COND_KEYS:
+        if is_link(inputs.get(key)):
+            text = _cond_text(prompt, inputs[key], depth + 1, seen)
+            if text and text not in parts:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def prompt_texts(prompt, anchor) -> tuple[str, str]:
+    """(positive, negative) text used by the anchor sampler."""
+    inputs = ((prompt or {}).get(str(anchor)) or {}).get("inputs") or {}
+    pos, neg = inputs.get("positive"), inputs.get("negative")
+    if pos is None and is_link(inputs.get("guider")):
+        g = (prompt.get(str(inputs["guider"][0])) or {}).get("inputs") or {}
+        pos, neg = g.get("positive", g.get("conditioning")), g.get("negative")
+    return _cond_text(prompt, pos), _cond_text(prompt, neg)
+
+
+def format_lora_field(loras) -> str:
+    """'name:0.8, other:0.65/0.5' (clip strength after '/' only when it differs)."""
+    parts = []
+    for lora in loras:
+        strength = fmt_num(lora["model"])
+        if lora["clip"] is not None and lora["clip"] != lora["model"]:
+            strength += "/" + fmt_num(lora["clip"])
+        parts.append(f"{model_stem(lora['name'])}:{strength}")
+    return ", ".join(parts)
+
+
+def find_vae(prompt, save_id):
+    """vae_name of the nearest separate VAE loader upstream of the save node, or None."""
+    dist = upstream_distances(prompt, save_id) if save_id in prompt else {}
+    for nid in sorted(dist, key=lambda n: (dist[n], natural_id(n))):
+        inputs = prompt[nid].get("inputs") or {}
+        if "vae_name" in inputs:
+            got = resolve(prompt, inputs["vae_name"], "vae_name")
+            if isinstance(got, str) and not name_is_off(got):
+                return got
+    return None
+
+
+def build_metadata(info, width, height, positive="", negative="", vae=None) -> dict:
+    """Ordered {keyword: text} of what produced the image; empty values left out.
+    'parameters' is the same data in A1111 form for Civitai and other readers."""
+    f = info.get("fields") or {}
+    loras = info.get("loras") or []
+    model = f.get("model")
+    num = lambda k: fmt_num(f.get(k)) if f.get(k) is not None else ""
+    out = {
+        "Prompt": positive,
+        "Negative": negative,
+        "Model": model_stem(model) if model else "",
+        "Checkpoint": str(model) if model else "",
+        "Sampler": str(f.get("sampler") or ""),
+        "Scheduler": str(f.get("scheduler") or ""),
+        "Steps": num("steps"),
+        "CFG": num("cfg"),
+        "Seed": str(f["seed"]) if f.get("seed") is not None else "",
+        "Denoise": num("denoise"),
+        "Guidance": num("guidance"),
+        "Size": f"{width}x{height}" if width and height else "",
+        "Lora": format_lora_field(loras),
+        "VAE": model_stem(vae) if vae else "",
+    }
+    out = {k: v for k, v in out.items() if v}
+
+    pairs = [("Steps", out.get("Steps")), ("Sampler", out.get("Sampler")),
+             ("Schedule type", out.get("Scheduler")), ("CFG scale", out.get("CFG")),
+             ("Seed", out.get("Seed")), ("Size", out.get("Size")), ("Model", out.get("Model")),
+             ("Denoising strength", out.get("Denoise")), ("Distilled CFG Scale", out.get("Guidance")),
+             ("VAE", out.get("VAE"))]
+    settings = ", ".join(f"{k}: {v}" for k, v in pairs if v)
+    lora_tags = " ".join(f"<lora:{model_stem(l['name'])}:{fmt_num(l['model'])}>" for l in loras)
+    lines = [" ".join(t for t in (positive, lora_tags) if t)]
+    if negative:
+        lines.append("Negative prompt: " + negative)
+    if settings:
+        lines.append(settings)
+    params = "\n".join(l for l in lines if l)
+    if params:
+        out["parameters"] = params
+    return out

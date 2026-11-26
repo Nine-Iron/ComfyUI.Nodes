@@ -17,9 +17,17 @@ shown in the Model Library and in loader dropdowns. When a model has preview fil
 beside it, the thumbnail some authors embed inside the model file is ignored,
 so the sidebar icon stays on your preview instead of switching on hover.
 
+Sidebar icons: ComfyUI's own icon route re-encodes every preview to WebP on
+the server's event loop, so while the Model Library loads hundreds of icons
+every other request (the popup's included) waits minutes. This extension
+serves that route itself instead: on a worker thread, two icons at a time,
+downscaled and cached on disk, so the popup stays responsive.
+
 Install: copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 """
 
+import hashlib
+import io
 import json
 import logging
 import os
@@ -814,6 +822,82 @@ def list_response(path, lite):
     return out
 
 
+# ------------------------------------------------------------ sidebar icons
+ICON_SIZE = 384     # longest side of a cached icon, in pixels
+ICON_WORKERS = 2    # icons encoded at once
+ICON_VERSION = 1
+
+
+def _icon_dir():
+    try:
+        directory = folder_paths.get_user_directory()
+    except Exception:
+        directory = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(directory, "model_preview_popup_icons")
+
+
+def _encode_icon(src):
+    from PIL import Image
+    with Image.open(src) as img:
+        img.thumbnail((ICON_SIZE, ICON_SIZE))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+        out = io.BytesIO()
+        img.save(out, format="WEBP", quality=85)
+        return out.getvalue()
+
+
+def model_icon(folder_name, path_index, filename):
+    """(status, webp bytes or None) for the Model Library's icon of one model,
+    with the same checks and preview choice as ComfyUI's own route."""
+    try:
+        if folder_name not in folder_paths.folder_names_and_paths:
+            return 404, None
+        if not filename:
+            return 400, None
+        try:
+            index = int(path_index)
+        except (TypeError, ValueError):
+            return 400, None
+        folders = folder_paths.folder_names_and_paths[folder_name][0]
+        if index < 0 or index >= len(folders):
+            return 404, None
+        folder = folders[index]
+        full = os.path.normpath(os.path.join(folder, filename))
+        if not folder_paths.is_within_directory(folder, full):
+            return 403, None
+        from server import PromptServer
+        previews = PromptServer.instance.model_file_manager.get_model_previews(full)
+        first = previews[0] if previews else None
+        if first is None:
+            return 404, None
+        if not isinstance(first, str):  # a cover image embedded in the model file
+            return 200, _encode_icon(first)
+        if not os.path.isfile(first) or not folder_paths.is_within_directory(folder, first):
+            return 404 if not os.path.isfile(first) else 403, None
+        st = os.stat(first)
+        key = hashlib.sha1(f"{ICON_VERSION}|{ICON_SIZE}|{first}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+        cached = os.path.join(_icon_dir(), key[:2], key + ".webp")
+        try:
+            with open(cached, "rb") as f:
+                return 200, f.read()
+        except OSError:
+            pass
+        body = _encode_icon(first)
+        try:
+            os.makedirs(os.path.dirname(cached), exist_ok=True)
+            tmp = f"{cached}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, cached)
+        except OSError as e:
+            logging.debug("[Model Preview Popup] could not cache icon: %s", e)
+        return 200, body
+    except Exception as e:
+        logging.debug("[Model Preview Popup] icon failed for %s/%s: %s", folder_name, filename, e)
+        return 404, None
+
+
 try:
     import asyncio
 
@@ -832,6 +916,21 @@ try:
         if not path:
             return web.json_response({"found": False, "images": []})
         return web.json_response(await asyncio.to_thread(list_response, path, lite))
+
+    # Registered before ComfyUI's own route of the same path (custom nodes load
+    # first), so this one answers the Model Library's icon requests.
+    _icon_slots = asyncio.Semaphore(ICON_WORKERS)
+
+    @routes.get("/experiment/models/preview/{folder}/{path_index}/{filename:.*}")
+    async def _model_icon(request):
+        folder_name = request.match_info.get("folder", "")
+        filename = request.match_info.get("filename", "")
+        path_index = request.match_info.get("path_index", "")
+        async with _icon_slots:  # leaves worker threads free for the popup
+            status, body = await asyncio.to_thread(model_icon, folder_name, path_index, filename)
+        if body is None:
+            return web.Response(status=status)
+        return web.Response(body=body, content_type="image/webp")
 
     @routes.get("/Model.Preview.Popup/bases")
     async def _bases(request):

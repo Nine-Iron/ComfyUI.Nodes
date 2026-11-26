@@ -151,7 +151,8 @@ function previewsFor(folder, filename, lite = false) {
   if (hit && Date.now() - hit.at < LIST_TTL) return hit.promise;
   const q = new URLSearchParams({ folder, filename });
   if (lite) q.set("lite", "1");
-  const promise = api.fetchApi(`/Model.Preview.Popup/list?${q}`)
+  // The hovered model's request goes ahead of the sidebar's icon downloads.
+  const promise = api.fetchApi(`/Model.Preview.Popup/list?${q}`, lite ? {} : { priority: "high" })
     .then((r) => (r.ok ? r.json() : {}))
     .then((d) => ({ images: Array.isArray(d.images) ? d.images : [], base: d.base || "unknown",
                     title: typeof d.title === "string" ? d.title : "", version: typeof d.version === "string" ? d.version : "",
@@ -250,7 +251,7 @@ function blobsFor(key) {
 async function loadImage(folder, filename, name, signal) {
   const cache = blobsFor(`${folder}/${filename}`);
   if (cache.has(name)) return cache.get(name);
-  const r = await fetch(imageUrl(folder, filename, name), { signal, cache: "no-cache" });
+  const r = await fetch(imageUrl(folder, filename, name), { signal, cache: "no-cache", priority: "high" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const u = URL.createObjectURL(await r.blob());
   if (signal.aborted) { URL.revokeObjectURL(u); throw new DOMException("aborted", "AbortError"); }

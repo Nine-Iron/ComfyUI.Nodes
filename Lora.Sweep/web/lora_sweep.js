@@ -1,14 +1,15 @@
-// LoRA Strength Sweep: sets strength_model / strength_clip on LoRA loaders
-// right before each queued run. ComfyUI calls beforeQueued() on every widget
+// LoRA Sweep: lists every LoRA in the pipeline and sets each one's strength
+// on its loader right before each queued run (on / off / sweep / random, with
+// a max number of LoRAs per run). ComfyUI calls beforeQueued() on every widget
 // before it builds each prompt of a batch, so run N of "Run x N" gets
-// combination N. Within the node, clip changes fastest.
+// combination N.
 import { app } from "../../scripts/app.js";
 
 // Shared sweep engine. Sampler Sweep, LoRA Strength Sweep and Checkpoint Sweep
 // each ship a copy; whichever loads first creates it and the others register
 // into it, so all sweep nodes in a workflow share one counter (a full grid of
 // runs). Keep the copies identical and bump ENGINE_VERSION in all of them.
-const ENGINE_VERSION = 3;
+const ENGINE_VERSION = 4;
 
 function createEngine(app, previous) {
   const KINDS = { ...(previous?.KINDS ?? {}) };
@@ -118,9 +119,21 @@ function createEngine(app, previous) {
 
   const nameOf = (n) => `${n.title || classOf(n)} #${n.id}`;
 
+  const keyOf = (p) => p.key ?? p.target;
+
+  // Helpers a kind with its own plan()/apply()/describe() can use.
+  const H = { widget, classOf, kindOf, graphNodes, expandNumbers, isConnected, nameOf: (n) => nameOf(n), FOLLOW };
+
   // One node's settings: the value list of every parameter that is not off.
+  // A kind may build its own (dynamic) parameter list with plan(node, H).
   function buildPlan(node) {
     const kind = kindOf(node);
+    if (kind.plan) {
+      const r = kind.plan(node, H);
+      const pl = { tgs: [], params: [], errors: [], warnings: [], ...r, node, kind };
+      pl.ok ??= pl.tgs.length > 0 && pl.errors.length === 0 && pl.params.length > 0;
+      return pl;
+    }
     const tgs = targets(node);
     const params = [], errors = [];
     for (const p of kind.params) {
@@ -181,24 +194,27 @@ function createEngine(app, previous) {
     let i = index;
     for (let k = gp.sweep.length - 1; k >= 0; k--) {
       const { p, pl } = gp.sweep[k];
-      out.get(pl.node)[p.target] = p.values[i % p.values.length];
+      out.get(pl.node)[keyOf(p)] = p.values[i % p.values.length];
       i = Math.floor(i / p.values.length);
     }
     for (const pl of gp.plans) {
       if (!pl.ok) continue;
       const vals = out.get(pl.node);
       for (const p of pl.params) {
-        if (p.mode === "random") vals[p.target] = rollRandom ? p.values[Math.floor(Math.random() * p.values.length)] : "random";
-        if (p.mode === FOLLOW) vals[p.target] = FOLLOW;
+        if (p.mode === "random") vals[keyOf(p)] = rollRandom ? p.values[Math.floor(Math.random() * p.values.length)] : "random";
+        if (p.mode === "fixed") vals[keyOf(p)] = p.values[0];
+        if (p.mode === FOLLOW) vals[keyOf(p)] = FOLLOW;
       }
     }
     return out;
   }
 
-  function describe(kind, vals) {
+  function describe(pl, vals, ran = false) {
+    if (pl.kind.describe) return pl.kind.describe(pl, vals, ran, H);
+    const kind = pl.kind;
     const bits = [];
     for (const p of kind.params) {
-      const v = vals[p.target];
+      const v = vals[keyOf(p)];
       if (v === undefined) continue;
       if (p.target === "steps") bits.push(`${v} st`);
       else if (p.target === "cfg") bits.push(`cfg ${v}`);
@@ -210,6 +226,7 @@ function createEngine(app, previous) {
 
   // Writes the values into the target nodes' widgets.
   function apply(pl, vals) {
+    if (pl.kind.apply) return pl.kind.apply(pl, vals, H) ?? [];
     const skipped = [];
     for (const t of pl.tgs) {
       for (const p of pl.kind.params) {
@@ -248,9 +265,9 @@ function createEngine(app, previous) {
       if (!pl) { setStatus(n, n.mode === 4 ? "bypassed" : n.mode === 2 ? "muted" : "off"); continue; }
       if (!pl.ok) { setStatus(n, pl.errors.join("; ") || "every setting is off"); continue; }
       const head = gp.sweep.length ? `${gp.total} combinations${shared} (set Run count to ${gp.total}). Next #${idx + 1}` : "Next";
-      const on = isConnected(n) ? ` → ${pl.tgs.map(nameOf).join(", ")}` : ` → all ${pl.tgs.length} ${pl.kind.noun}(s)`;
+      const on = pl.targetText ?? (isConnected(n) ? ` → ${pl.tgs.map(nameOf).join(", ")}` : ` → all ${pl.tgs.length} ${pl.kind.noun}(s)`);
       const warn = pl.warnings.length ? ` ⚠ ${pl.warnings.join("; ")}` : "";
-      setStatus(n, `${head}: ${describe(pl.kind, vals.get(n))}${on}${warn}`);
+      setStatus(n, `${head}: ${describe(pl, vals.get(n))}${on}${warn}`);
     }
   }
 
@@ -271,7 +288,7 @@ function createEngine(app, previous) {
       const skipped = apply(pl, vals.get(pl.node));
       const tag = gp.sweep.length ? `#${idx + 1}/${gp.total} ` : "";
       const done = gp.sweep.length && next === 0 ? " (sweep done, starts over)" : "";
-      setStatus(pl.node, `Ran ${tag}${describe(pl.kind, vals.get(pl.node))}${done}${skipped.length ? ` [skipped: ${skipped.join(", ")}]` : ""}`);
+      setStatus(pl.node, `Ran ${tag}${describe(pl, vals.get(pl.node), true)}${done}${skipped.length ? ` [skipped: ${skipped.join(", ")}]` : ""}`);
     }
   }
 
@@ -340,7 +357,10 @@ function createEngine(app, previous) {
     };
   }
 
-  return { version: ENGINE_VERSION, KINDS, setup };
+  // For a kind's own UI: a changed setting starts the sweep over / refreshes the preview.
+  const restart = (graph) => { if (graph) { setIndex(graph, 0); later(graph); } };
+
+  return { version: ENGINE_VERSION, KINDS, setup, restart, refresh: later, H };
 }
 
 function sweepEngine(app) {
@@ -349,18 +369,337 @@ function sweepEngine(app) {
   return window.__comfySweepEngine;
 }
 
+// ------------------------------------------------------------------ LoRA kind
+// One row per LoRA in the pipeline, each with a mode (on / off / sweep /
+// random) and its own strength or min/max. The rows live in
+// node.properties.loraSettings, keyed by loader node id (or "id:lora_N" for an
+// rgthree Power Lora Loader entry), so they are saved with the workflow.
+
+const MODES = ["on", "off", "sweep", "random"];
+const LIST_ROW = 24;
+const fmt = (v) => (typeof v === "number" ? String(Number(v.toFixed(3))) : String(v));
+const shortName = (s) => {
+  const b = String(s).split(/[\\/]/).pop().replace(/\.(safetensors|ckpt|pt|pth|bin)$/i, "");
+  return b.length > 30 ? b.slice(0, 29) + "…" : b;
+};
+const isActive = (n) => n.mode !== 2 && n.mode !== 4; // 2 muted, 4 bypassed
+const linkOf = (graph, id) => graph.links?.get?.(id) ?? graph.links?.[id];
+
+// The LoRAs one node loads: [{key, node, name, power, w}].
+function loraSources(n, H) {
+  if (H.kindOf(n)) return [];
+  const out = [];
+  const nameW = H.widget(n, "lora_name");
+  if (nameW && H.widget(n, "strength_model")) {
+    out.push({ key: String(n.id), node: n, name: String(nameW.value ?? ""), power: false });
+  }
+  for (const w of n.widgets ?? []) {
+    const v = w.value;
+    if (/^lora_\d+$/i.test(w.name ?? "") && v && typeof v === "object" && v.lora && v.lora !== "None") {
+      out.push({ key: `${n.id}:${w.name}`, node: n, name: String(v.lora), power: true, w });
+    }
+  }
+  return out;
+}
+
+// The pipeline: with something wired in, every node upstream of it (the whole
+// chain, furthest upstream first); otherwise every node, top of the canvas first.
+function pipelineNodes(node, H) {
+  const graph = node.graph ?? app.graph;
+  if (!graph) return [];
+  if (!H.isConnected(node)) {
+    return [...H.graphNodes(graph)].sort((a, b) =>
+      (a.pos?.[1] ?? 0) - (b.pos?.[1] ?? 0) || (a.pos?.[0] ?? 0) - (b.pos?.[0] ?? 0));
+  }
+  const seen = new Set([node.id]), queue = [node], out = [];
+  while (queue.length) {
+    const n = queue.shift();
+    for (const inp of n.inputs ?? []) {
+      if (inp.link == null || (n === node && inp.widget)) continue;
+      const link = linkOf(graph, inp.link);
+      const from = link && graph.getNodeById(link.origin_id);
+      if (!from || seen.has(from.id)) continue;
+      seen.add(from.id);
+      out.push(from);
+      queue.push(from);
+    }
+  }
+  return out.reverse();
+}
+
+const findRows = (node, H) => pipelineNodes(node, H).flatMap((n) => loraSources(n, H));
+const rowsSig = (rows) => rows.map((r) => `${r.key}|${r.name}|${isActive(r.node)}`).join("\n");
+
+function settingsOf(node) {
+  const p = (node.properties ??= {});
+  if (!p.loraSettings || typeof p.loraSettings !== "object") p.loraSettings = {};
+  return p.loraSettings;
+}
+
+// A row's settings; a LoRA seen for the first time starts "on" at the
+// loader's current strength (or "off" if a Power Lora entry is switched off).
+function rowSettings(node, src, H) {
+  const all = settingsOf(node);
+  let s = all[src.key];
+  if (!s || typeof s !== "object") {
+    const cur = src.power ? src.w.value.strength : H.widget(src.node, "strength_model")?.value;
+    s = all[src.key] = {
+      mode: src.power && src.w.value.on === false ? "off" : "on",
+      strength: typeof cur === "number" && cur !== 0 ? cur : 1,
+      min: 0.4,
+      max: 1,
+    };
+  }
+  s.name = src.name;
+  return s;
+}
+
+const maxLoras = (node, H) => Math.max(0, Math.floor(Number(H.widget(node, "max_loras")?.value) || 0));
+
 sweepEngine(app).KINDS.LoraSweep = {
   noun: "LoRA loader",
-  params: [
-    { name: "strength_model", mode: "model_mode", target: "strength_model", kind: "float", label: "model" },
-    { name: "strength_clip", mode: "clip_mode", target: "strength_clip", kind: "float", label: "clip",
-      follows: "strength_model" },
-  ],
+  params: [],
+
+  plan(node, H) {
+    const rows = findRows(node, H);
+    const step = Number(H.widget(node, "step")?.value);
+    const stepS = fmt(step > 0 ? step : 0.1);
+    const params = [], errors = [];
+    for (const src of rows) {
+      const s = rowSettings(node, src, H);
+      src.s = s;
+      src.active = isActive(src.node);
+      if (!src.active || s.mode === "off") continue;
+      const label = shortName(src.name);
+      if (s.mode === "on") {
+        const v = Number(s.strength);
+        if (Number.isFinite(v)) params.push({ key: src.key, mode: "fixed", values: [v], label, src });
+        else errors.push(`${label}: strength is not a number`);
+        continue;
+      }
+      const res = H.expandNumbers(`${fmt(Number(s.min))}..${fmt(Number(s.max))}:${stepS}`, "float");
+      errors.push(...res.errors.map((e) => `${label}: ${e}`));
+      if (res.values.length) params.push({ key: src.key, mode: s.mode, values: res.values, label, src });
+      else errors.push(`${label}: no values`);
+    }
+    if (!rows.length) {
+      errors.push(H.isConnected(node) ? "no LoRA loader upstream of what is wired in" : "no LoRA loader found");
+    }
+    node.__loraRows = rows;
+    const sig = rowsSig(rows);
+    if (sig !== node.__loraRendered) {
+      node.__loraRendered = sig;
+      setTimeout(() => renderList(node), 0);
+    }
+    return { tgs: [...new Set(rows.map((r) => r.node))], rows, params, errors, ok: rows.length > 0 && !errors.length, targetText: "" };
+  },
+
+  // Each run: "on" LoRAs always, the remaining max_loras slots filled at random
+  // from the sweep/random ones; everything else (and "off") at strength 0.
+  apply(pl, vals, H) {
+    const max = maxLoras(pl.node, H);
+    const picked = new Set(pl.params.filter((p) => p.src.s.mode === "on").map((p) => p.key));
+    const rest = pl.params.filter((p) => !picked.has(p.key));
+    for (let i = rest.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    for (const p of rest) {
+      if (max && picked.size >= max) break;
+      picked.add(p.key);
+    }
+    vals.__picked = picked;
+
+    const skipped = [];
+    const set = (n, name, v) => {
+      const w = H.widget(n, name);
+      if (!w) return; // e.g. strength_clip on LoraLoaderModelOnly
+      if (n.inputs?.some((inp) => inp.widget?.name === name && inp.link != null)) {
+        skipped.push(`${name} on #${n.id} is linked`);
+        return;
+      }
+      w.value = v;
+      w.callback?.(v);
+    };
+    for (const src of pl.rows) {
+      if (!src.active) continue;
+      const use = picked.has(src.key);
+      const v = use ? vals[src.key] : 0;
+      if (src.power) {
+        const cur = src.w.value;
+        cur.on = use;
+        if (use) {
+          cur.strength = v;
+          if (cur.strengthTwo != null) cur.strengthTwo = v;
+        }
+      } else {
+        set(src.node, "strength_model", v);
+        set(src.node, "strength_clip", v);
+      }
+      src.node.setDirtyCanvas?.(true, true);
+    }
+    return skipped;
+  },
+
+  describe(pl, vals, ran, H) {
+    const max = maxLoras(pl.node, H);
+    const picked = ran ? vals.__picked : null;
+    const bits = [];
+    for (const p of pl.params) {
+      if (picked && !picked.has(p.key)) continue;
+      const v = vals[p.key];
+      bits.push(`${p.label} ${v === "random" ? "random" : fmt(v)}`);
+    }
+    let text = bits.join(" · ") || (pl.rows.length ? "every LoRA off" : "no LoRA");
+    const always = pl.params.filter((p) => p.src.s.mode === "on").length;
+    const pool = pl.params.length - always;
+    const slots = Math.max(0, max - always);
+    const limited = max && pool > 0 && slots < pool;
+    if (limited && !ran) {
+      text += always
+        ? ` (the ${always} "on" + ${slots} of the other ${pool} each run, picked at random)`
+        : ` (${slots} of these ${pool} each run, picked at random)`;
+    }
+    if (limited && ran) text += ` (${picked.size} of ${pl.params.length})`;
+    return text;
+  },
 };
+
+// ------------------------------------------------------------------ LoRA list UI
+
+function listHeight(node) {
+  return 6 + Math.max(1, node.__loraRows?.length ?? 0) * LIST_ROW;
+}
+
+function changed(node, rerender) {
+  if (rerender) renderList(node);
+  sweepEngine(app).restart(node.graph);
+}
+
+function renderList(node) {
+  const el = node.__loraEl;
+  if (!el) return;
+  const rows = node.__loraRows ?? [];
+  el.replaceChildren();
+  if (!rows.length) {
+    el.textContent = "No LoRA loaders found.";
+  }
+  const input = (value, disabled, onChange) => {
+    const i = document.createElement("input");
+    i.type = "number";
+    i.step = "0.05";
+    i.value = disabled ? "" : fmt(Number(value));
+    i.disabled = disabled;
+    Object.assign(i.style, {
+      width: "100%", boxSizing: "border-box", background: "var(--comfy-input-bg, #222)",
+      color: "inherit", border: "1px solid var(--border-color, #444)", borderRadius: "3px", padding: "1px 3px",
+      opacity: disabled ? "0.35" : "1",
+    });
+    i.addEventListener("change", () => onChange(parseFloat(i.value)));
+    return i;
+  };
+  for (const src of rows) {
+    const s = src.s ?? rowSettings(node, src, sweepEngine(app).H);
+    const line = document.createElement("div");
+    Object.assign(line.style, {
+      display: "grid", gridTemplateColumns: "minmax(0,1fr) 72px 54px 54px", gap: "4px",
+      alignItems: "center", height: `${LIST_ROW - 2}px`, opacity: src.active === false ? "0.45" : "1",
+    });
+
+    const label = document.createElement("span");
+    label.textContent = `${shortName(src.name)} #${src.node.id}` + (src.active === false ? " (bypassed)" : "");
+    label.title = `${src.name}\non ${src.node.title || src.node.type} #${src.node.id}`;
+    Object.assign(label.style, { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" });
+
+    const sel = document.createElement("select");
+    for (const m of MODES) sel.add(new Option(m, m, false, m === s.mode));
+    Object.assign(sel.style, {
+      width: "100%", background: "var(--comfy-input-bg, #222)", color: "inherit",
+      border: "1px solid var(--border-color, #444)", borderRadius: "3px",
+    });
+    sel.addEventListener("change", () => { s.mode = sel.value; changed(node, true); });
+
+    line.append(label, sel);
+    if (s.mode === "on") {
+      const i = input(s.strength, false, (v) => { s.strength = v; changed(node); });
+      i.title = "strength";
+      i.style.gridColumn = "span 2";
+      line.append(i);
+    } else {
+      const off = s.mode === "off";
+      const lo = input(s.min, off, (v) => { s.min = v; changed(node); });
+      const hi = input(s.max, off, (v) => { s.max = v; changed(node); });
+      lo.title = "min";
+      hi.title = "max";
+      line.append(lo, hi);
+    }
+    el.append(line);
+  }
+  const h = listHeight(node);
+  el.style.height = `${h}px`;
+  const size = node.computeSize?.();
+  if (size) node.setSize([Math.max(node.size?.[0] ?? 0, 460), size[1]]);
+  node.setDirtyCanvas?.(true, true);
+}
+
+function setupList(nodeType) {
+  const created = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function () {
+    const r = created?.apply(this, arguments);
+    const node = this;
+    settingsOf(node);
+    const el = document.createElement("div");
+    Object.assign(el.style, {
+      display: "flex", flexDirection: "column", gap: "2px", font: "12px sans-serif",
+      color: "var(--input-text, #ddd)", padding: "3px 4px", boxSizing: "border-box", overflow: "hidden",
+    });
+    // Keep canvas shortcuts (delete, ctrl+c...) from firing while typing.
+    el.addEventListener("keydown", (e) => e.stopPropagation());
+    node.__loraEl = el;
+    const w = node.addDOMWidget?.("loras", "lora_sweep_list", el, {
+      serialize: false,
+      hideOnZoom: false,
+      getMinHeight: () => listHeight(node),
+      getMaxHeight: () => listHeight(node),
+    });
+    if (w) {
+      w.serializeValue = () => undefined;
+      w.computeSize = (width) => [width, listHeight(node)];
+    }
+    return r;
+  };
+
+  // Notice LoRA loaders being added, removed, swapped or bypassed.
+  const draw = nodeType.prototype.onDrawForeground;
+  nodeType.prototype.onDrawForeground = function () {
+    const r = draw?.apply(this, arguments);
+    const now = performance.now();
+    if (this.graph && now - (this.__loraChecked ?? 0) > 700) {
+      this.__loraChecked = now;
+      if (rowsSig(findRows(this, sweepEngine(app).H)) !== this.__loraRendered) sweepEngine(app).refresh(this.graph);
+    }
+    return r;
+  };
+
+  // Workflows saved with the old LoRA Strength Sweep (model_mode, strength_model,
+  // clip_mode, strength_clip) load their values into the wrong widgets: reset.
+  const configure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function (info) {
+    const r = configure?.apply(this, arguments);
+    const H = sweepEngine(app).H;
+    const maxW = H.widget(this, "max_loras"), stepW = H.widget(this, "step");
+    if (maxW && typeof maxW.value !== "number") maxW.value = 0;
+    if (stepW && !(typeof stepW.value === "number" && stepW.value > 0)) stepW.value = 0.1;
+    settingsOf(this);
+    return r;
+  };
+}
 
 app.registerExtension({
   name: "LoraSweep",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name === "LoraSweep") sweepEngine(app).setup(nodeType);
+    if (nodeData.name !== "LoraSweep") return;
+    sweepEngine(app).setup(nodeType);
+    setupList(nodeType);
   },
 });

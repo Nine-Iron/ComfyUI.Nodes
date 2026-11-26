@@ -3,11 +3,19 @@
 Default layout:
     {workflow}/{date}/{sampler}-{scheduler}/{loras}-{steps}-{cfg}-{denoise}-{seed}
 """
+import json
 import logging
+import os
 
+import numpy as np
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
+import folder_paths
+from comfy.cli_args import args
 from nodes import SaveImage
 
-from .pathbuilder import DEFAULT_TEMPLATE, build_prefix
+from .pathbuilder import DEFAULT_TEMPLATE, build_metadata, build_prefix, find_vae, prompt_texts
 
 log = logging.getLogger("TaggedImageSaver")
 
@@ -26,6 +34,18 @@ def _return_types(class_type):
         return tuple(str(t) for t in types)
     except Exception:
         return None
+
+
+METADATA_MODES = ["essentials + workflow", "essentials", "full (ComfyUI default)"]
+
+
+def _add_text(png, key, value):
+    """tEXt for Latin-1 text, iTXt (UTF-8) otherwise."""
+    try:
+        value.encode("latin-1")
+        png.add_text(key, value)
+    except UnicodeEncodeError:
+        png.add_itxt(key, value)
 
 
 TEMPLATE_HELP = (
@@ -67,6 +87,13 @@ class TaggedImageSaver(SaveImage):
                     "tooltip": "Comma-separated class-name fragments to skip when scanning, "
                                "e.g. TagPicker,Sweep",
                 }),
+                "metadata": (METADATA_MODES, {
+                    "default": METADATA_MODES[0],
+                    "tooltip": "essentials: only what made the image (Prompt, Negative, Model, Checkpoint, "
+                               "Sampler, Scheduler, Steps, CFG, Seed, Lora, ...) as separate PNG fields "
+                               "readable with exiftool. + workflow: also the workflow, so dragging the "
+                               "image into ComfyUI reloads it. full: ComfyUI's complete graph as well.",
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -85,8 +112,10 @@ class TaggedImageSaver(SaveImage):
 
     def save_tagged(self, images, template, workflow_name, sampler_pick,
                     lora_name_max=40, no_lora_text="nolora", ignore_classes="",
+                    metadata=METADATA_MODES[0],
                     prompt=None, extra_pnginfo=None, unique_id=None):
         height, width = int(images[0].shape[0]), int(images[0].shape[1])
+        info = None
         try:
             prefix, info = build_prefix(
                 prompt or {}, unique_id, template, workflow_name, sampler_pick,
@@ -98,10 +127,52 @@ class TaggedImageSaver(SaveImage):
             log.exception("TaggedImageSaver: path build failed, falling back to 'ComfyUI'")
             prefix = "ComfyUI"
 
-        out = self.save_images(images, prefix, prompt, extra_pnginfo)
+        fields = None
+        if info is not None:
+            try:
+                positive, negative = prompt_texts(prompt or {}, info.get("anchor"))
+                vae = find_vae(prompt or {}, str(unique_id))
+                fields = build_metadata(info, width, height, positive, negative, vae)
+            except Exception:
+                log.exception("TaggedImageSaver: metadata build failed, saving full ComfyUI metadata")
+
+        if fields is None or metadata == METADATA_MODES[2]:
+            out = self.save_png(images, prefix, prompt, extra_pnginfo, fields, full=True)
+        else:
+            workflow = extra_pnginfo if metadata == METADATA_MODES[0] else None
+            out = self.save_png(images, prefix, None, workflow, fields, full=False)
         ui = dict(out.get("ui", {}))
         ui["text"] = [prefix]
         return {"ui": ui, "result": (images, prefix)}
+
+
+    def save_png(self, images, prefix, prompt, extra_pnginfo, fields, full):
+        """SaveImage.save_images with our own text chunks. In full mode ComfyUI's
+        'prompt' graph is kept, so the positive text goes under 'Positive' instead
+        (exiftool shows the 'prompt' chunk as Prompt too)."""
+        prefix += self.prefix_append
+        folder, filename, counter, subfolder, prefix = folder_paths.get_save_image_path(
+            prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+        results = []
+        for batch_number, image in enumerate(images):
+            img = Image.fromarray(np.clip(255.0 * image.cpu().numpy(), 0, 255).astype(np.uint8))
+            png = None
+            if not args.disable_metadata:
+                png = PngInfo()
+                for key, value in (fields or {}).items():
+                    if full and key == "Prompt":
+                        key = "Positive"
+                    _add_text(png, key, value)
+                if full and prompt is not None:
+                    png.add_text("prompt", json.dumps(prompt))
+                for key, value in (extra_pnginfo or {}).items():
+                    if full or key == "workflow":
+                        png.add_text(key, json.dumps(value))
+            file = f"{filename.replace('%batch_num%', str(batch_number))}_{counter:05}_.png"
+            img.save(os.path.join(folder, file), pnginfo=png, compress_level=self.compress_level)
+            results.append({"filename": file, "subfolder": subfolder, "type": self.type})
+            counter += 1
+        return {"ui": {"images": results}, "result": (images,)}
 
 
 NODE_CLASS_MAPPINGS = {"TaggedImageSaver": TaggedImageSaver}

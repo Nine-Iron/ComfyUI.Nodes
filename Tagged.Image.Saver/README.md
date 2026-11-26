@@ -22,6 +22,7 @@ Put the `Tagged.Image.Saver` folder in `ComfyUI/custom_nodes/` (or symlink it th
 | `lora_name_max` | 40 | Characters kept per LoRA name. |
 | `no_lora_text` | `nolora` | What `{loras}` becomes when nothing is active. |
 | `ignore_classes` | empty | Comma-separated class-name fragments to skip, e.g. `TagPicker,Sweep`. |
+| `metadata` | `essentials + workflow` | What goes into the PNG. See **Metadata** below. |
 
 Outputs: `images` (passthrough) and `path` (the resolved prefix). The resolved prefix also shows in the node's `last_saved` field after each run.
 
@@ -30,6 +31,33 @@ Outputs: `images` (passthrough) and `path` (the resolved prefix). The resolved p
 `{workflow}` `{date}` `{date:yyyy-MM-dd_hhmm}` `{time}` `{sampler}` `{scheduler}` `{steps}` `{cfg}` `{denoise}` `{seed}` `{guidance}` `{model}` `{loras}` `{lora_names}` `{lora_count}` `{width}` `{height}`
 
 ComfyUI's own `%width%`, `%year%` etc. and `%batch_num%` also still work.
+
+## Metadata
+
+Each setting that made the picture is its own PNG text field, so exiftool reads them by name:
+
+| Field | Example |
+|---|---|
+| `Prompt` / `Negative` | the text actually encoded (including Prompt Generator / LoRA Tag Picker output) |
+| `Model` / `Checkpoint` | `copaxTimeless_xivSDXL` / `sdxl1/copaxTimeless_xivSDXL.safetensors` |
+| `Sampler` `Scheduler` `Steps` `CFG` `Seed` `Denoise` `Guidance` | from the sampler `sampler_pick` chooses |
+| `Size` | `1024x1024` |
+| `Lora` | `Psychedelic:0.8, inkwash:0.65/0.5`: only LoRAs that ran, `/clip` when clip strength differs |
+| `VAE` | only when a separate VAE loader is used |
+| `Parameters` | the same data as an A1111 block, for Civitai and Model Preview Popup |
+
+Empty fields are left out.
+
+```
+exiftool -Prompt -Model -Sampler -Lora image.png
+exiftool -s -Seed -CFG -Steps *.png
+exiftool -csv -Model -Lora -Seed -r output/ > runs.csv
+```
+
+`metadata` modes:
+- `essentials + workflow` (default): the fields above plus `Workflow`, so dragging the image into ComfyUI still loads the workflow.
+- `essentials`: the fields only. Smallest file. ComfyUI can't reload the workflow from the image.
+- `full (ComfyUI default)`: the fields plus ComfyUI's API graph and workflow. The positive text is stored as `Positive` here, because exiftool also shows ComfyUI's graph as `Prompt`.
 
 ## How it finds things
 

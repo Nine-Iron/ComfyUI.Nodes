@@ -9,7 +9,7 @@ import { app } from "../../scripts/app.js";
 // each ship a copy; whichever loads first creates it and the others register
 // into it, so all sweep nodes in a workflow share one counter (a full grid of
 // runs). Keep the copies identical and bump ENGINE_VERSION in all of them.
-const ENGINE_VERSION = 3;
+const ENGINE_VERSION = 4;
 
 function createEngine(app, previous) {
   const KINDS = { ...(previous?.KINDS ?? {}) };
@@ -119,9 +119,21 @@ function createEngine(app, previous) {
 
   const nameOf = (n) => `${n.title || classOf(n)} #${n.id}`;
 
+  const keyOf = (p) => p.key ?? p.target;
+
+  // Helpers a kind with its own plan()/apply()/describe() can use.
+  const H = { widget, classOf, kindOf, graphNodes, expandNumbers, isConnected, nameOf: (n) => nameOf(n), FOLLOW };
+
   // One node's settings: the value list of every parameter that is not off.
+  // A kind may build its own (dynamic) parameter list with plan(node, H).
   function buildPlan(node) {
     const kind = kindOf(node);
+    if (kind.plan) {
+      const r = kind.plan(node, H);
+      const pl = { tgs: [], params: [], errors: [], warnings: [], ...r, node, kind };
+      pl.ok ??= pl.tgs.length > 0 && pl.errors.length === 0 && pl.params.length > 0;
+      return pl;
+    }
     const tgs = targets(node);
     const params = [], errors = [];
     for (const p of kind.params) {
@@ -182,24 +194,27 @@ function createEngine(app, previous) {
     let i = index;
     for (let k = gp.sweep.length - 1; k >= 0; k--) {
       const { p, pl } = gp.sweep[k];
-      out.get(pl.node)[p.target] = p.values[i % p.values.length];
+      out.get(pl.node)[keyOf(p)] = p.values[i % p.values.length];
       i = Math.floor(i / p.values.length);
     }
     for (const pl of gp.plans) {
       if (!pl.ok) continue;
       const vals = out.get(pl.node);
       for (const p of pl.params) {
-        if (p.mode === "random") vals[p.target] = rollRandom ? p.values[Math.floor(Math.random() * p.values.length)] : "random";
-        if (p.mode === FOLLOW) vals[p.target] = FOLLOW;
+        if (p.mode === "random") vals[keyOf(p)] = rollRandom ? p.values[Math.floor(Math.random() * p.values.length)] : "random";
+        if (p.mode === "fixed") vals[keyOf(p)] = p.values[0];
+        if (p.mode === FOLLOW) vals[keyOf(p)] = FOLLOW;
       }
     }
     return out;
   }
 
-  function describe(kind, vals) {
+  function describe(pl, vals, ran = false) {
+    if (pl.kind.describe) return pl.kind.describe(pl, vals, ran, H);
+    const kind = pl.kind;
     const bits = [];
     for (const p of kind.params) {
-      const v = vals[p.target];
+      const v = vals[keyOf(p)];
       if (v === undefined) continue;
       if (p.target === "steps") bits.push(`${v} st`);
       else if (p.target === "cfg") bits.push(`cfg ${v}`);
@@ -211,6 +226,7 @@ function createEngine(app, previous) {
 
   // Writes the values into the target nodes' widgets.
   function apply(pl, vals) {
+    if (pl.kind.apply) return pl.kind.apply(pl, vals, H) ?? [];
     const skipped = [];
     for (const t of pl.tgs) {
       for (const p of pl.kind.params) {
@@ -249,9 +265,9 @@ function createEngine(app, previous) {
       if (!pl) { setStatus(n, n.mode === 4 ? "bypassed" : n.mode === 2 ? "muted" : "off"); continue; }
       if (!pl.ok) { setStatus(n, pl.errors.join("; ") || "every setting is off"); continue; }
       const head = gp.sweep.length ? `${gp.total} combinations${shared} (set Run count to ${gp.total}). Next #${idx + 1}` : "Next";
-      const on = isConnected(n) ? ` → ${pl.tgs.map(nameOf).join(", ")}` : ` → all ${pl.tgs.length} ${pl.kind.noun}(s)`;
+      const on = pl.targetText ?? (isConnected(n) ? ` → ${pl.tgs.map(nameOf).join(", ")}` : ` → all ${pl.tgs.length} ${pl.kind.noun}(s)`);
       const warn = pl.warnings.length ? ` ⚠ ${pl.warnings.join("; ")}` : "";
-      setStatus(n, `${head}: ${describe(pl.kind, vals.get(n))}${on}${warn}`);
+      setStatus(n, `${head}: ${describe(pl, vals.get(n))}${on}${warn}`);
     }
   }
 
@@ -272,7 +288,7 @@ function createEngine(app, previous) {
       const skipped = apply(pl, vals.get(pl.node));
       const tag = gp.sweep.length ? `#${idx + 1}/${gp.total} ` : "";
       const done = gp.sweep.length && next === 0 ? " (sweep done, starts over)" : "";
-      setStatus(pl.node, `Ran ${tag}${describe(pl.kind, vals.get(pl.node))}${done}${skipped.length ? ` [skipped: ${skipped.join(", ")}]` : ""}`);
+      setStatus(pl.node, `Ran ${tag}${describe(pl, vals.get(pl.node), true)}${done}${skipped.length ? ` [skipped: ${skipped.join(", ")}]` : ""}`);
     }
   }
 
@@ -341,7 +357,10 @@ function createEngine(app, previous) {
     };
   }
 
-  return { version: ENGINE_VERSION, KINDS, setup };
+  // For a kind's own UI: a changed setting starts the sweep over / refreshes the preview.
+  const restart = (graph) => { if (graph) { setIndex(graph, 0); later(graph); } };
+
+  return { version: ENGINE_VERSION, KINDS, setup, restart, refresh: later, H };
 }
 
 function sweepEngine(app) {
