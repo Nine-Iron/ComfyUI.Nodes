@@ -8,6 +8,7 @@ Small tools for working with models and prompts in [ComfyUI](https://github.com/
 | [`Prompt.Generator/`](#prompt-generator) | Custom nodes | Makes random prompts, from wildcard templates or by asking a language model (Claude, ChatGPT, or a local server). |
 | [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, with the prompt and settings each preview was made with, and lets you hide base models you don't use. |
 | [`Checkpoint.Sweep/`, `Sampler.Sweep/`, `Lora.Sweep/`](#sweeps) | Custom nodes | Change the checkpoint, sampler settings or LoRA strengths on every run of a batch, through every combination or at random. |
+| [`Image.Recall/`](#image-recall) | Custom nodes + workflow | Drop an image to reload the checkpoint, LoRAs, prompts and settings it was made with, then outpaint it to a new aspect ratio and upscale it. |
 | [`moFlo/`](#moflo) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
 
 Each one works on its own, and they work well together: moFlo saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
@@ -20,6 +21,7 @@ Each one works on its own, and they work well together: moFlo saves previews, th
 - [Prompt Generator](#prompt-generator)
 - [Model Preview Popup](#model-preview-popup)
 - [Sweeps](#sweeps)
+- [Image Recall](#image-recall)
 - [moFlo](#moflo)
 - [HTTP routes](#http-routes)
 - [Troubleshooting](#troubleshooting)
@@ -42,6 +44,7 @@ cp -r Lora.Tag.Picker     ~/ComfyUI/custom_nodes/
 cp -r Prompt.Generator    ~/ComfyUI/custom_nodes/
 cp -r Model.Preview.Popup ~/ComfyUI/custom_nodes/
 cp -r Checkpoint.Sweep Sampler.Sweep Lora.Sweep ~/ComfyUI/custom_nodes/
+cp -r Image.Recall Tagged.Image.Saver ~/ComfyUI/custom_nodes/
 ```
 
 To pick up updates with a `git pull`, symlink instead of copying:
@@ -244,6 +247,51 @@ Each setting has a mode: **off** (leave it alone), **sweep** (step through the l
 `*` respects Model Preview Popup's base filter: base models you have hidden there are not swept.
 
 Every new model is a full load, which takes a while on small machines such as a Jetson, and **random** may load a different model every run. Prefer **sweep** for checkpoints, and keep the list short, for example a few patterns rather than `*` across a large folder.
+
+## Image Recall
+
+Drop an image and get back what made it: Image Recall loads the checkpoint and LoRAs recorded in the image and outputs its prompts, seed, steps, cfg, sampler and scheduler. With **Outpaint Canvas** and **Tiled Refine**, the included workflow turns a 1024x1024 SDXL image into a wider (or taller) one and upscales it, with no settings typed in by hand.
+
+### Usage
+
+1. Workflow menu → **Browse Templates** → **Image.Recall** → **SDXL Outpaint + Upscale**.
+2. Drag your PNG onto the **Image Recall** node itself (or click its upload button). Don't drop it on the empty canvas: that loads the PNG's own workflow instead. The box under the node shows what it found; lines starting with `!` are things it could not find (a missing LoRA is skipped).
+3. On **Outpaint Canvas**, pick `aspect` and `anchor`. In `prompt_prefix` on Image Recall, describe what the new area should show.
+4. Queue.
+
+The workflow runs: pass 1 fills the new area at SDXL size (about 1 megapixel) → the original pixels are pasted back → RealESRGAN x4 (`models/upscale_models/RealESRGAN_x4.pth`) → resize to the exact ratio → Tiled Refine adds detail in 1024px tiles → Tagged Image Saver. A 1024x1024 image at 16:9 comes out 2688x1512.
+
+### Image Recall (loaders)
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `image` | | An image in ComfyUI's input folder. Drop or upload it onto the node. |
+| `checkpoint` | `(from image)` | Uses the checkpoint the image names; pick one to override it. |
+| `apply_loras` | on | Loads the LoRAs the image names, in order. |
+| `lora_scale` | `1.0` | Multiplies every recalled LoRA strength. |
+| `prompt_prefix` | `wide shot` | Put in front of the recalled prompt. Not added again if the prompt already starts with it. |
+| `prompt_override`, `negative_override` | | Replace the recalled prompt or negative when not empty. |
+
+Outputs: `model`, `clip`, `vae` (LoRAs applied), `image`, `positive`, `negative`, `seed`, `steps`, `cfg`, `sampler_name`, `scheduler` (these wire straight into KSampler), and `info`.
+
+It reads, in this order, filling in whatever is still missing: Tagged Image Saver's fields (`Checkpoint`, `Prompt`, `Lora`, ...), the ComfyUI graph (the first sampler feeding the save node, its LoRAs and prompt text), and A1111 `parameters` text with `<lora:name:weight>` tags (Civitai, Forge, moFlo previews). Model names are matched by path first, then by file name, preferring the checkpoint's own folder (so a LoRA `foo` resolves to `sdxl1/foo.safetensors` next to an `sdxl1/` checkpoint).
+
+When queued, it writes the resolved checkpoint, LoRAs and settings into its own entry of the saved graph. Tagged Image Saver then names and tags the result correctly, and a later Image Recall of the result works too.
+
+### Outpaint Canvas (image)
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `aspect` | `16:9` | `16:9 9:16 21:9 9:21 4:3 3:4 3:2 2:3 1:1`. The canvas is SDXL's bucket for it: 1344x768, 1536x640, 1152x896, 1216x832, 1024x1024 (and portrait). |
+| `anchor` | `center` | Where the original sits: `center` grows both sides, `left` grows to the right, `top` grows downward, and so on. |
+| `feather` | `48` | Pixels of the original blended into the new area. |
+| `upscale_by` | `2.0` | Sets `final_width` / `final_height`: the canvas times this, trimmed to the exact ratio. |
+
+Outputs `canvas` (the original scaled onto a gray canvas), `mask` (1 = generate), `width`, `height`, `final_width`, `final_height`.
+
+### Tiled Refine (sampling)
+
+An img2img pass over a large image in overlapping tiles (`tile_size` 1024, `overlap` 128), blended together, so SDXL can add detail to a 2688px upscale on a GPU with little memory. `denoise` 0.2 stays close to the upscale; 0.4 adds more detail and more change. If seams show, raise `overlap`.
 
 ## moFlo
 
@@ -448,6 +496,7 @@ The ComfyUI pieces add these routes to the ComfyUI server, handy for scripts:
 | `GET /Lora.Tag.Picker/tags?name=<lora name>` | A LoRA's ranked tags, image count, and notes, as JSON |
 | `GET /Model.Preview.Popup/list?folder=<folder>&filename=<file>` | A model's preview file names, the generation settings of each picture that has them, and its base model |
 | `GET /Model.Preview.Popup/image?folder=<folder>&filename=<file>&name=<preview>` | One preview image (only files the list route returns) |
+| `GET /image_recall/info?filename=<input image>` | What Image Recall would load for an image in the input folder, as `{text, found}` |
 | `GET /Model.Preview.Popup/bases` | The base model of every file in the filtered folders, plus labels |
 
 Names are as ComfyUI lists them, relative to the model folder (for example `flux1_dev/x.safetensors`).

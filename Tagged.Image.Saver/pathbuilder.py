@@ -474,6 +474,10 @@ def _linked_text(prompt, value, depth=0):
         return ""
     node = prompt.get(str(value[0])) or {}
     meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+    # Nodes with several text outputs (Image Recall) record each one by output slot.
+    per_output = meta.get("output_texts")
+    if isinstance(per_output, dict) and isinstance(per_output.get(str(value[1])), str):
+        return per_output[str(value[1])]
     for key in META_TEXT_KEYS:
         if isinstance(meta.get(key), str):
             return meta[key]
