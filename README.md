@@ -8,7 +8,7 @@ Small tools for working with models and prompts in [ComfyUI](https://github.com/
 | [`Prompt.Generator/`](#prompt-generator) | Custom nodes | Makes random prompts, from wildcard templates or by asking a language model (Claude, ChatGPT, or a local server). |
 | [`Model.Preview.Popup/`](#model-preview-popup) | Frontend extension (no nodes) | Shows a large preview popup when you hover a model in the Model Library sidebar, with the prompt and settings each preview was made with, and lets you hide base models you don't use. |
 | [`Checkpoint.Sweep/`, `Sampler.Sweep/`, `Lora.Sweep/`](#sweeps) | Custom nodes | Change the checkpoint, sampler settings or LoRA strengths on every run of a batch, through every combination or at random. |
-| [`Image.Recall/`](#image-recall) | Custom nodes + workflow | Drop an image to reload the checkpoint, LoRAs, prompts and settings it was made with, then outpaint it to a new aspect ratio and upscale it. |
+| [`Image.Recall/`](#image-recall) | Custom nodes + subgraph | Drop an image anywhere: a subgraph reloads the checkpoint, LoRAs, prompts and settings it was made with, lists them for editing, and outpaints, upscales, or both. |
 | [`moFlo/`](#moflo) | Command-line tool (Go) | Downloads the models you have liked on Civitai, with preview images, skipping anything you already have. |
 
 Each one works on its own, and they work well together: moFlo saves previews, their generation settings, and base-model tags in the layout Model Preview Popup reads, and LoRA Tag Picker reads the tags inside the LoRAs it downloads.
@@ -250,22 +250,35 @@ Every new model is a full load, which takes a while on small machines such as a 
 
 ## Image Recall
 
-Drop an image and get back what made it: Image Recall loads the checkpoint and LoRAs recorded in the image and outputs its prompts, seed, steps, cfg, sampler and scheduler. With **Outpaint Canvas** and **Tiled Refine**, the included workflow turns a 1024x1024 SDXL image into a wider (or taller) one and upscales it, with no settings typed in by hand.
+Drop an image anywhere in the ComfyUI window and get back what made it. The **Image Recall - Outpaint & Upscale** subgraph reads the checkpoint, LoRAs, prompts, seed, steps, cfg and sampler from the image. It lists them all on the node, where you can change any of them, then outpaints the image, upscales it, or both.
 
 ### Usage
 
-1. Workflow menu → **Browse Templates** → **Image.Recall** → **SDXL Outpaint + Upscale**.
-2. Drag your PNG onto the **Image Recall** node itself (or click its upload button). Don't drop it on the empty canvas: that loads the PNG's own workflow instead. The box under the node shows what it found; lines starting with `!` are things it could not find (a missing LoRA is skipped).
-3. On **Outpaint Canvas**, pick `aspect` and `anchor`. In `prompt_prefix` on Image Recall, describe what the new area should show.
+1. Add the subgraph with one of these:
+   - Node Library → **Image Recall** → **Image Recall - Outpaint & Upscale**.
+   - Workflow menu → **Browse Templates** → **Image.Recall** → **Image Recall - Outpaint & Upscale**.
+2. Drop an image anywhere in the window, or paste one with Ctrl+V. To get ComfyUI's normal behaviour (load the image's workflow), hold **Shift** while dropping. A drop onto some other node (a Load Image, say) is left to that node.
+3. The panel on the node fills in what the image recorded. Lines in red are things it could not find, such as a missing LoRA, which is left unticked. Change anything there:
+   - mode
+   - checkpoint
+   - each LoRA: on/off, model and clip strength, remove, add
+   - prompt, negative, subject and its weight
+   - seed, steps, cfg, sampler, scheduler
+   - aspect, where the original sits, feather
+   - upscale long side, steps, denoise
+
+   **Reset to image** reloads the image's own values.
 4. Queue.
 
-Three steps run:
+| Mode | What runs | Cost (normal render = one 1024x1024 at the image's steps) |
+| --- | --- | --- |
+| `outpaint` | Step 1: grow the picture to the chosen aspect at SDXL size (1344x768 for 16:9) | about 1 |
+| `outpaint + upscale` | Step 1, then Step 2 | about 3 |
+| `upscale` | Step 2 only, on the original: lanczos resize to the render size (1920x1088), one SDXL pass at denoise 0.3, tiled decode, crop to the exact size (1920x1080) | about 2 |
 
-1. **Outpaint**: fills the new area at SDXL size (about 1 megapixel) with the image's own sampler settings, then pastes the original pixels back. The recalled prompt applies only over the original pixels. The new area gets `outpaint_positive`, where the main subject is weighted down so it doesn't appear a second time. This costs about one normal render.
-2. **Upscale**: RealESRGAN x4 (`models/upscale_models/RealESRGAN_x4.pth`), then a resize to the exact ratio. A 1024x1024 image at 16:9 comes out 2688x1512. This step is fast.
-3. **Tiled Refine**: re-details the big image in 1024px tiles, then Tagged Image Saver saves it. 2688x1512 is 6 tiles, and each costs like one SDXL render at this step's own step count (default 10 steps of `dpmpp_2m`), so about one Step 1 in total.
+The parts the mode doesn't use don't run at all: the subgraph picks its path with lazy If/Else switches.
 
-On an 8 GB machine, many LoRAs slow every step down a lot: untick `apply_loras` for a quick test. For a fast draft, select Step 3 and press Ctrl+B to bypass it.
+The panel's **Estimate** shows these numbers for your settings before you queue. After a run on this machine it adds minutes, timed from the progress bar. Every step runs whatever the denoise. Samplers such as `dpmpp_2s_ancestral`, `dpmpp_sde` and `heun` make 2 model calls per step, and the panel warns about them. On an 8 GB machine, many LoRAs also slow every step down.
 
 ### Image Recall (loaders)
 
@@ -279,8 +292,10 @@ On an 8 GB machine, many LoRAs slow every step down a lot: untick `apply_loras` 
 | `prompt_override`, `negative_override` | | Replace the recalled prompt or negative when not empty. |
 | `subject` | | Main object of the picture (`cat`, or `cat, kitten`). Weighted down in the `outpaint_positive` output so the outpainted area doesn't repeat it. Empty = first part of the prompt (quality tags skipped); `none` = off. |
 | `subject_weight` | `0.4` | Subject weight in `outpaint_positive`: `0` removes it, `1` leaves the prompt as is. |
+| `mode` | `outpaint + upscale` | Sets the `do_outpaint` / `do_upscale` outputs, which pick the path in the subgraph. |
+| `settings` | | The panel's edits, as JSON. They override what the image recorded. Empty = use the image. |
 
-Outputs: `model`, `clip`, `vae` (LoRAs applied), `image`, `positive`, `negative`, `seed`, `steps`, `cfg`, `sampler_name`, `scheduler` (these wire straight into KSampler), and `info`.
+Outputs: `model`, `clip`, `vae` (LoRAs applied), `image`, `positive`, `negative`, `seed`, `steps`, `cfg`, `sampler_name`, `scheduler` (these wire straight into KSampler), `info`, `outpaint_positive`, `do_outpaint` and `do_upscale`.
 
 It reads, in this order, filling in whatever is still missing: Tagged Image Saver's fields (`Checkpoint`, `Prompt`, `Lora`, ...), the ComfyUI graph (the first sampler feeding the save node, its LoRAs and prompt text), and A1111 `parameters` text with `<lora:name:weight>` tags (Civitai, Forge, moFlo previews). Model names are matched by path first, then by file name, preferring the checkpoint's own folder (so a LoRA `foo` resolves to `sdxl1/foo.safetensors` next to an `sdxl1/` checkpoint).
 
@@ -297,9 +312,14 @@ When queued, it writes the resolved checkpoint, LoRAs and settings into its own 
 
 Outputs `canvas` (the original scaled onto a gray canvas), `mask` (1 = generate), `width`, `height`, `final_width`, `final_height`.
 
-### Tiled Refine (sampling)
+### Upscale Size (image)
 
-An img2img pass over a large image in overlapping tiles (`tile_size` 1024, `overlap` 128), blended together, so SDXL can add detail to a 2688px upscale on a GPU with little memory. Every step runs even at a low `denoise`, so the cost is tiles × `steps`: keep `steps` low (default 10) and use a sampler that makes one model call per step (default `dpmpp_2m` / `karras`; `*_2s_*` and SDE samplers cost double). The node shows one progress bar over all tiles and logs `tile i/n` to the console. `denoise` 0.2 stays close to the upscale; 0.4 adds more detail and more change. If seams show, raise `overlap`.
+| Input | Default | Notes |
+| --- | --- | --- |
+| `aspect` | `(from image)` | The result's ratio: the image's own, or one of the Outpaint Canvas ratios. |
+| `long_side` | `1920` | Long side of the result. |
+
+Outputs: `render_width` and `render_height` (rounded up to 64; 1920x1088 for 16:9) for the upscale pass, and `width` and `height` (the exact ratio, 1920x1080) to crop to afterwards.
 
 ## moFlo
 
@@ -505,6 +525,7 @@ The ComfyUI pieces add these routes to the ComfyUI server, handy for scripts:
 | `GET /Model.Preview.Popup/list?folder=<folder>&filename=<file>` | A model's preview file names, the generation settings of each picture that has them, and its base model |
 | `GET /Model.Preview.Popup/image?folder=<folder>&filename=<file>&name=<preview>` | One preview image (only files the list route returns) |
 | `GET /image_recall/info?filename=<input image>` | What Image Recall would load for an image in the input folder, as `{text, found}` |
+| `GET /image_recall/recall?filename=<input image>` | The same as structured JSON (checkpoint, LoRAs, prompts, settings, notes), plus the lists of checkpoints, LoRAs, samplers and schedulers. The settings panel uses it. |
 | `GET /Model.Preview.Popup/bases` | The base model of every file in the filtered folders, plus labels |
 
 Names are as ComfyUI lists them, relative to the model folder (for example `flux1_dev/x.safetensors`).

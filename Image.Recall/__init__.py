@@ -4,12 +4,12 @@ Image Recall: drop an image on the node and it loads the checkpoint and LoRAs th
 image was made with, and outputs its prompts and sampler settings.
 Outpaint Canvas: places the image on an SDXL-sized canvas of a chosen aspect
 ratio and returns the mask of the area to fill.
-Tiled Refine: a low-denoise img2img pass over a large image in overlapping tiles,
-so SDXL can add detail to an upscale without running out of memory.
+Upscale Size: the render and final size for the one-pass SDXL upscale.
 
-The example workflow (example_workflows/) chains them into outpaint -> upscale.
+The subgraph in subgraphs/ chains them into outpaint / outpaint + upscale / upscale.
 """
 import hashlib
+import json
 import logging
 import math
 import os
@@ -17,8 +17,6 @@ import re
 
 import torch
 
-import comfy.model_management
-import comfy.sample
 import comfy.samplers
 import comfy.utils
 import folder_paths
@@ -30,6 +28,7 @@ from .graphinfo import model_stem
 log = logging.getLogger("ImageRecall")
 
 FROM_IMAGE = "(from image)"
+MODES = ["outpaint", "outpaint + upscale", "upscale"]
 DEFAULTS = {"seed": 0, "steps": 25, "cfg": 6.0, "sampler": "euler", "scheduler": "normal"}
 
 
@@ -116,6 +115,60 @@ def outpaint_text(r, prompt_prefix, prompt_override, subject, subject_weight):
     return join_prompt(prompt_prefix, deweight(base, subject, subject_weight))
 
 
+def parse_settings(text):
+    """The panel's edits: a JSON object, or {} when empty or invalid."""
+    try:
+        s = json.loads(text) if isinstance(text, str) and text.strip() else {}
+    except ValueError:
+        s = {}
+    return s if isinstance(s, dict) else {}
+
+
+def effective(r, w):
+    """What will actually run: the recalled values, then the node's widgets, then the
+    panel's edits (the `settings` JSON) on top. `w` is the node's widget values."""
+    s = parse_settings(w.get("settings"))
+    ckpt_choice = s.get("checkpoint") or w.get("checkpoint") or FROM_IMAGE
+    ckpt, loras, notes = plan(r, ckpt_choice, bool(w.get("apply_loras", True)), float(w.get("lora_scale", 1.0)))
+    if isinstance(s.get("loras"), list):
+        loras = []
+        for l in s["loras"]:
+            if not isinstance(l, dict) or not l.get("on", True):
+                continue
+            found = find_model("loras", l.get("name"), _top_dir(ckpt))
+            if not found:
+                notes.append(f"! LoRA not found, skipped: {l.get('name')}")
+                continue
+            m = float(l.get("model", 1.0))
+            c = l.get("clip")
+            loras.append((found, m, m if c is None else float(c)))
+    seed, steps, cfg, sampler, scheduler = settings(r)
+    try:
+        seed = int(s.get("seed", seed))
+        steps = max(1, int(s.get("steps", steps)))
+        cfg = float(s.get("cfg", cfg))
+    except (TypeError, ValueError):
+        pass
+    if s.get("sampler") in comfy.samplers.KSampler.SAMPLERS:
+        sampler = s["sampler"]
+    if s.get("scheduler") in comfy.samplers.KSampler.SCHEDULERS:
+        scheduler = s["scheduler"]
+    pp, po, no = w.get("prompt_prefix", ""), w.get("prompt_override", ""), w.get("negative_override", "")
+    positive, negative = texts(r, pp, po, no)
+    outpaint = outpaint_text(r, pp, po, w.get("subject", ""), float(w.get("subject_weight", 0.4)))
+    if isinstance(s.get("positive"), str) and s["positive"].strip():
+        positive = outpaint = s["positive"].strip()
+    if isinstance(s.get("negative"), str):
+        negative = s["negative"].strip()
+    mode = w.get("mode") if w.get("mode") in MODES else MODES[1]
+    if mode == "upscale":
+        outpaint = positive  # no new area: the subject is not weighted down
+    return {"ckpt": ckpt, "loras": loras, "notes": notes, "positive": positive, "negative": negative,
+            "outpaint": outpaint, "seed": seed, "steps": steps, "cfg": cfg, "sampler": sampler,
+            "scheduler": scheduler, "mode": mode,
+            "do_outpaint": mode != "upscale", "do_upscale": mode != "outpaint"}
+
+
 # --- main subject, weighted down for the outpainted area ------------------
 QUALITY_TAGS = re.compile(r"^(score_\w+|masterpiece|best quality|(high|highly|ultra|very|extremely)[ -]?"
                           r"(quality|detailed|res|resolution)|\d+k|uhd|hdr|absurdres|photo ?realistic|"
@@ -195,9 +248,10 @@ def _image_files():
 class ImageRecall:
     CATEGORY = "loaders"
     RETURN_TYPES = ("MODEL", "CLIP", "VAE", "IMAGE", "STRING", "STRING", "INT", "INT", "FLOAT",
-                    comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "STRING", "STRING")
+                    comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "STRING", "STRING",
+                    "BOOLEAN", "BOOLEAN")
     RETURN_NAMES = ("model", "clip", "vae", "image", "positive", "negative", "seed", "steps", "cfg",
-                    "sampler_name", "scheduler", "info", "outpaint_positive")
+                    "sampler_name", "scheduler", "info", "outpaint_positive", "do_outpaint", "do_upscale")
     FUNCTION = "load"
     DESCRIPTION = ("Drop an image on this node: it loads the checkpoint and LoRAs the image was made "
                    "with and outputs its prompts and sampler settings. Reads Tagged Image Saver, "
@@ -231,6 +285,12 @@ class ImageRecall:
                 "subject_weight": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.5, "step": 0.05,
                                              "tooltip": "Subject weight in outpaint_positive. 0 removes it, "
                                                         "1 leaves the prompt as is."}),
+                "mode": (MODES, {"default": MODES[1],
+                                 "tooltip": "outpaint, outpaint + upscale, or upscale only. Sets do_outpaint "
+                                            "/ do_upscale, which pick the path in the subgraph."}),
+                "settings": ("STRING", {"default": "", "multiline": True,
+                                        "tooltip": "Edits made on the settings panel (JSON). Empty = use "
+                                                   "what the image recorded."}),
             },
         }
 
@@ -247,24 +307,22 @@ class ImageRecall:
             return f"Invalid image file: {image}"
         return True
 
-    def load(self, image, checkpoint, apply_loras, lora_scale, prompt_prefix, prompt_override,
-             negative_override, subject="", subject_weight=0.4):
+    def load(self, image, **w):
         path = folder_paths.get_annotated_filepath(image)
         r = rc.recall_file(path)
-        ckpt, loras, notes = plan(r, checkpoint, apply_loras, lora_scale)
+        e = effective(r, w)
+        ckpt, notes = e["ckpt"], e["notes"]
         if not ckpt:
             raise ValueError("Image Recall: " + " ".join(n.lstrip("! ") for n in notes if "heckpoint" in n))
         model, clip, vae = nodes.CheckpointLoaderSimple().load_checkpoint(ckpt)[:3]
         lora_loader = nodes.LoraLoader()
-        for name, sm, sc in loras:
+        for name, sm, sc in e["loras"]:
             model, clip = lora_loader.load_lora(model, clip, name, sm, sc)
         img = nodes.LoadImage().load_image(image)[0]
-        positive, negative = texts(r, prompt_prefix, prompt_override, negative_override)
-        seed, steps, cfg, sampler, scheduler = settings(r)
-        outpaint = outpaint_text(r, prompt_prefix, prompt_override, subject, subject_weight)
-        info = rc.describe(r, notes) + f"\nOutpaint area prompt: {outpaint or '(none)'}"
-        log.info("Image Recall %s: %s + %d LoRA(s)", image, ckpt, len(loras))
-        return (model, clip, vae, img, positive, negative, seed, steps, cfg, sampler, scheduler, info, outpaint)
+        info = rc.describe(r, notes) + f"\nPrompt used: {e['outpaint'] or '(none)'}"
+        log.info("Image Recall %s (%s): %s + %d LoRA(s)", image, e["mode"], ckpt, len(e["loras"]))
+        return (model, clip, vae, img, e["positive"], e["negative"], e["seed"], e["steps"], e["cfg"],
+                e["sampler"], e["scheduler"], info, e["outpaint"], e["do_outpaint"], e["do_upscale"])
 
 
 # --- Outpaint Canvas ------------------------------------------------------
@@ -353,93 +411,46 @@ class OutpaintCanvas:
         return (canvas, mask, L["W"], L["H"], L["final_w"], L["final_h"])
 
 
-# --- Tiled Refine ---------------------------------------------------------
-def tile_spans(length, tile, overlap):
-    """[(start, size)] covering 0..length with tiles of `tile` px (multiples of 8)."""
-    if length <= tile:
-        size = max(8, length // 8 * 8)
-        return [(0, size)] if size == length else [(0, size), (length - size, size)]
-    n = math.ceil((length - overlap) / (tile - overlap))
-    n = max(n, 2)
-    return [(int(round(i * (length - tile) / (n - 1))), tile) for i in range(n)]
+# --- Upscale Size ---------------------------------------------------------
+def ceil64(v):
+    return int(math.ceil(v / 64.0)) * 64
 
 
-def _ramp(size, start, length, overlap):
-    w = torch.ones(size, dtype=torch.float32)
-    if overlap <= 0:
-        return w
-    ramp = (torch.arange(size, dtype=torch.float32) + 0.5) / overlap
-    if start > 0:
-        w = torch.minimum(w, ramp.clamp(max=1))
-    if start + size < length:
-        w = torch.minimum(w, ramp.flip(0).clamp(max=1))
-    return w.clamp(min=1e-3)
+def upscale_size(src_w, src_h, aspect, long_side):
+    """(render_w, render_h, width, height): the exact-ratio final size with its long side
+    at `long_side`, and the render size rounded up to 64 (cropped back after decoding)."""
+    if aspect in BUCKETS:
+        ra, rb = (int(n) for n in aspect.split(":"))
+    else:
+        ra, rb = src_w, src_h
+    if ra >= rb:
+        w, h = long_side, round8(long_side * rb / ra)
+    else:
+        w, h = round8(long_side * ra / rb), long_side
+    return ceil64(w), ceil64(h), w, h
 
 
-class TiledRefine:
-    CATEGORY = "sampling"
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "refine"
-    DESCRIPTION = ("Low-denoise img2img over a large image in overlapping tiles, blended together. "
-                   "Lets SDXL add detail to an upscale on a small GPU.")
+class UpscaleSize:
+    CATEGORY = "image"
+    RETURN_TYPES = ("INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("render_width", "render_height", "width", "height")
+    FUNCTION = "size"
+    DESCRIPTION = ("Final size for the one-pass SDXL upscale: the exact ratio with the long side at "
+                   "long_side (16:9 at 1920 = 1920x1080), and the render size rounded up to 64 (1920x1088).")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "model": ("MODEL",),
-            "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",),
-            "vae": ("VAE",),
             "image": ("IMAGE",),
-            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
-            "steps": ("INT", {"default": 10, "min": 1, "max": 200,
-                              "tooltip": "Steps per tile. Every step runs even at low denoise, so the "
-                                         "total cost is tiles x steps (6 tiles at 2688x1512)."}),
-            "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.1, "round": 0.01}),
-            "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "dpmpp_2m",
-                             "tooltip": "Prefer a 1-call-per-step sampler; *_2s_* and sde samplers cost double."}),
-            "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "karras"}),
-            "denoise": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
-                                  "tooltip": "0.2 keeps it closer to the upscale, 0.4 adds more detail."}),
-            "tile_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
-            "overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 8}),
+            "aspect": ([FROM_IMAGE] + list(BUCKETS), {"default": FROM_IMAGE,
+                       "tooltip": "(from image) keeps the image's own ratio."}),
+            "long_side": ("INT", {"default": 1920, "min": 512, "max": 8192, "step": 8,
+                                  "tooltip": "Long side of the result. The upscale pass renders about "
+                                             "(long_side x short side) pixels: 1920x1088 = about 2 normal renders."}),
         }}
 
-    def refine(self, model, positive, negative, vae, image, seed, steps, cfg, sampler_name, scheduler,
-               denoise, tile_size, overlap):
-        overlap = min(overlap, tile_size // 2)
-        B, H, W, _ = image.shape
-        xs, ys = tile_spans(W, tile_size, overlap), tile_spans(H, tile_size, overlap)
-        acc = torch.zeros((B, H, W, 3), dtype=torch.float32)
-        wsum = torch.zeros((1, H, W, 1), dtype=torch.float32)
-        n_tiles = len(xs) * len(ys)
-        total = n_tiles * steps
-        log.info("Tiled Refine: %d tiles (%dx%d) x %d steps = %d sampler steps", n_tiles, len(xs), len(ys),
-                 steps, total)
-        pbar = comfy.utils.ProgressBar(total)  # one bar for the whole node, not one per tile
-        index = 0
-        for y, th in ys:
-            for x, tw in xs:
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                tile = image[:, y:y + th, x:x + tw, :3]
-                log.info("Tiled Refine: tile %d/%d", index + 1, n_tiles)
-                latent = comfy.sample.fix_empty_latent_channels(model, vae.encode(tile))
-                noise = comfy.sample.prepare_noise(latent, seed + index)
-                done = index * steps
-                cb = lambda step, x0, x, total_steps, done=done: pbar.update_absolute(done + step + 1, total)
-                samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative,
-                                              latent, denoise=denoise, callback=cb, disable_pbar=True,
-                                              seed=seed + index)
-                decoded = vae.decode(samples)
-                if decoded.dim() == 5:
-                    decoded = decoded.reshape(-1, *decoded.shape[-3:])
-                decoded = decoded[:, :th, :tw, :3].float().cpu()
-                weight = (_ramp(th, y, H, overlap).view(th, 1) * _ramp(tw, x, W, overlap).view(1, tw))
-                weight = weight.view(1, th, tw, 1)
-                acc[:, y:y + th, x:x + tw] += decoded * weight
-                wsum[:, y:y + th, x:x + tw] += weight
-                index += 1
-        return ((acc / wsum).clamp(0, 1).to(image.dtype),)
+    def size(self, image, aspect, long_side):
+        return upscale_size(image.shape[2], image.shape[1], aspect, long_side)
 
 
 # --- queue-time metadata --------------------------------------------------
@@ -457,25 +468,18 @@ def _on_prompt(json_data):
             if not isinstance(image, str) or not folder_paths.exists_annotated_filepath(image):
                 continue
             r = rc.recall_file(folder_paths.get_annotated_filepath(image))
-            literal = lambda k, d: inputs.get(k, d) if not isinstance(inputs.get(k), list) else d
-            ckpt, loras, _ = plan(r, literal("checkpoint", FROM_IMAGE), bool(literal("apply_loras", True)),
-                                  float(literal("lora_scale", 1.0)))
-            if ckpt:
-                inputs["ckpt_name"] = ckpt
-            for i, (name, sm, sc) in enumerate(loras, 1):
+            w = {k: v for k, v in inputs.items() if not isinstance(v, list)}  # literal widget values only
+            e = effective(r, w)
+            if e["ckpt"]:
+                inputs["ckpt_name"] = e["ckpt"]
+            for i, (name, sm, sc) in enumerate(e["loras"], 1):
                 inputs[f"lora_{i:02d}"] = name
                 inputs[f"model_strength_{i:02d}"] = round(sm, 4)
                 inputs[f"clip_strength_{i:02d}"] = round(sc, 4)
-            seed, steps, cfg, sampler, scheduler = settings(r)
-            inputs.update(seed=seed, steps=steps, cfg=cfg, sampler_name=sampler, scheduler=scheduler)
-            strings = [literal(k, None) for k in ("prompt_prefix", "prompt_override", "negative_override")]
-            if all(isinstance(s, str) for s in strings):
-                pos, neg = texts(r, *strings)
-                meta = node.setdefault("_meta", {})
-                meta["output_texts"] = {"4": pos, "5": neg}
-                subj, sw = literal("subject", ""), literal("subject_weight", 0.4)
-                if isinstance(subj, str) and isinstance(sw, (int, float)):
-                    meta["output_texts"]["12"] = outpaint_text(r, strings[0], strings[1], subj, float(sw))
+            inputs.update(seed=e["seed"], steps=e["steps"], cfg=e["cfg"], sampler_name=e["sampler"],
+                          scheduler=e["scheduler"])
+            node.setdefault("_meta", {})["output_texts"] = {"4": e["positive"], "5": e["negative"],
+                                                            "12": e["outpaint"]}
     except Exception as e:  # never block a queue over metadata
         log.warning("Image Recall: could not record metadata: %s", e)
     return json_data
@@ -509,14 +513,49 @@ try:
         except Exception as e:
             return web.json_response({"text": f"Could not read {name}: {e}"}, status=400)
 
+    @PromptServer.instance.routes.get("/image_recall/recall")
+    async def _image_recall_recall(request):
+        """Everything the settings panel shows for an image, plus the choices for its selects."""
+        q = request.query
+        name = q.get("filename", "")
+        try:
+            path = folder_paths.get_annotated_filepath(name)
+            if not os.path.isfile(path):
+                return web.json_response({"error": f"File not found: {name}"}, status=404)
+            r = rc.recall_file(path)
+            try:
+                sw = float(q.get("subject_weight", 0.4))
+            except ValueError:
+                sw = 0.4
+            ckpt, _, notes = plan(r)
+            seed, steps, cfg, sampler, scheduler = settings(r)
+            loras = []
+            for l in r.get("loras") or []:
+                found = find_model("loras", l["name"], _top_dir(ckpt))
+                loras.append({"name": found or l["name"], "found": bool(found), "on": bool(found),
+                              "model": l["model"], "clip": l["model"] if l.get("clip") is None else l["clip"]})
+            return web.json_response({
+                "found": bool(r["sources"]), "sources": r["sources"], "notes": notes, "size": r.get("size"),
+                "checkpoint": ckpt or "", "checkpoint_recorded": r.get("checkpoint") or "",
+                "loras": loras, "positive": r.get("positive") or "", "negative": r.get("negative") or "",
+                "outpaint_positive": outpaint_text(r, q.get("prompt_prefix", ""), "", q.get("subject", ""), sw),
+                "seed": seed, "steps": steps, "cfg": cfg, "sampler": sampler, "scheduler": scheduler,
+                "choices": {"checkpoints": folder_paths.get_filename_list("checkpoints"),
+                            "loras": folder_paths.get_filename_list("loras"),
+                            "samplers": list(comfy.samplers.KSampler.SAMPLERS),
+                            "schedulers": list(comfy.samplers.KSampler.SCHEDULERS)},
+            })
+        except Exception as e:
+            return web.json_response({"error": f"Could not read {name}: {e}"}, status=400)
+
     PromptServer.instance.add_on_prompt_handler(_on_prompt)
 except Exception as e:
     log.warning("Image Recall: could not register route/handler: %s", e)
 
 
 NODE_CLASS_MAPPINGS = {"ImageRecall": ImageRecall, "OutpaintCanvas": OutpaintCanvas,
-                       "TiledRefine": TiledRefine}
+                       "UpscaleSize": UpscaleSize}
 NODE_DISPLAY_NAME_MAPPINGS = {"ImageRecall": "Image Recall", "OutpaintCanvas": "Outpaint Canvas",
-                              "TiledRefine": "Tiled Refine"}
+                              "UpscaleSize": "Upscale Size"}
 WEB_DIRECTORY = "./web"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
