@@ -259,7 +259,13 @@ Drop an image and get back what made it: Image Recall loads the checkpoint and L
 3. On **Outpaint Canvas**, pick `aspect` and `anchor`. In `prompt_prefix` on Image Recall, describe what the new area should show.
 4. Queue.
 
-The workflow runs: pass 1 fills the new area at SDXL size (about 1 megapixel) → the original pixels are pasted back → RealESRGAN x4 (`models/upscale_models/RealESRGAN_x4.pth`) → resize to the exact ratio → Tiled Refine adds detail in 1024px tiles → Tagged Image Saver. A 1024x1024 image at 16:9 comes out 2688x1512.
+Three steps run:
+
+1. **Outpaint**: fills the new area at SDXL size (about 1 megapixel) with the image's own sampler settings, then pastes the original pixels back. The recalled prompt applies only over the original pixels. The new area gets `outpaint_positive`, where the main subject is weighted down so it doesn't appear a second time. This costs about one normal render.
+2. **Upscale**: RealESRGAN x4 (`models/upscale_models/RealESRGAN_x4.pth`), then a resize to the exact ratio. A 1024x1024 image at 16:9 comes out 2688x1512. This step is fast.
+3. **Tiled Refine**: re-details the big image in 1024px tiles, then Tagged Image Saver saves it. 2688x1512 is 6 tiles, and each costs like one SDXL render at this step's own step count (default 10 steps of `dpmpp_2m`), so about one Step 1 in total.
+
+On an 8 GB machine, many LoRAs slow every step down a lot: untick `apply_loras` for a quick test. For a fast draft, select Step 3 and press Ctrl+B to bypass it.
 
 ### Image Recall (loaders)
 
@@ -271,6 +277,8 @@ The workflow runs: pass 1 fills the new area at SDXL size (about 1 megapixel) �
 | `lora_scale` | `1.0` | Multiplies every recalled LoRA strength. |
 | `prompt_prefix` | `wide shot` | Put in front of the recalled prompt. Not added again if the prompt already starts with it. |
 | `prompt_override`, `negative_override` | | Replace the recalled prompt or negative when not empty. |
+| `subject` | | Main object of the picture (`cat`, or `cat, kitten`). Weighted down in the `outpaint_positive` output so the outpainted area doesn't repeat it. Empty = first part of the prompt (quality tags skipped); `none` = off. |
+| `subject_weight` | `0.4` | Subject weight in `outpaint_positive`: `0` removes it, `1` leaves the prompt as is. |
 
 Outputs: `model`, `clip`, `vae` (LoRAs applied), `image`, `positive`, `negative`, `seed`, `steps`, `cfg`, `sampler_name`, `scheduler` (these wire straight into KSampler), and `info`.
 
@@ -291,7 +299,7 @@ Outputs `canvas` (the original scaled onto a gray canvas), `mask` (1 = generate)
 
 ### Tiled Refine (sampling)
 
-An img2img pass over a large image in overlapping tiles (`tile_size` 1024, `overlap` 128), blended together, so SDXL can add detail to a 2688px upscale on a GPU with little memory. `denoise` 0.2 stays close to the upscale; 0.4 adds more detail and more change. If seams show, raise `overlap`.
+An img2img pass over a large image in overlapping tiles (`tile_size` 1024, `overlap` 128), blended together, so SDXL can add detail to a 2688px upscale on a GPU with little memory. Every step runs even at a low `denoise`, so the cost is tiles × `steps`: keep `steps` low (default 10) and use a sampler that makes one model call per step (default `dpmpp_2m` / `karras`; `*_2s_*` and SDE samplers cost double). The node shows one progress bar over all tiles and logs `tile i/n` to the console. `denoise` 0.2 stays close to the upscale; 0.4 adds more detail and more change. If seams show, raise `overlap`.
 
 ## moFlo
 

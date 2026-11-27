@@ -37,6 +37,10 @@ app.registerExtension({
           filename: String(image),
           checkpoint: String(widget("checkpoint")?.value ?? "(from image)"),
           apply_loras: String(widget("apply_loras")?.value ?? true),
+          prompt_prefix: String(widget("prompt_prefix")?.value ?? ""),
+          prompt_override: String(widget("prompt_override")?.value ?? ""),
+          subject: String(widget("subject")?.value ?? ""),
+          subject_weight: String(widget("subject_weight")?.value ?? 0.4),
         });
         let text;
         try {
@@ -50,7 +54,8 @@ app.registerExtension({
         node.setDirtyCanvas?.(true, true);
       };
 
-      for (const name of ["image", "checkpoint", "apply_loras"]) {
+      for (const name of ["image", "checkpoint", "apply_loras", "prompt_prefix", "prompt_override", "subject",
+                          "subject_weight"]) {
         const w = widget(name);
         if (!w) continue;
         const cb = w.callback;

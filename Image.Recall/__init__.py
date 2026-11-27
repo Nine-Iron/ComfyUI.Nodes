@@ -13,10 +13,12 @@ import hashlib
 import logging
 import math
 import os
+import re
 
 import torch
 
 import comfy.model_management
+import comfy.sample
 import comfy.samplers
 import comfy.utils
 import folder_paths
@@ -108,6 +110,81 @@ def texts(r, prompt_prefix, prompt_override, negative_override):
     return join_prompt(prompt_prefix, base), neg.strip()
 
 
+def outpaint_text(r, prompt_prefix, prompt_override, subject, subject_weight):
+    """Prompt for the outpainted area: the recalled prompt with the main subject weighted down."""
+    base = prompt_override if (prompt_override or "").strip() else (r.get("positive") or "")
+    return join_prompt(prompt_prefix, deweight(base, subject, subject_weight))
+
+
+# --- main subject, weighted down for the outpainted area ------------------
+QUALITY_TAGS = re.compile(r"^(score_\w+|masterpiece|best quality|(high|highly|ultra|very|extremely)[ -]?"
+                          r"(quality|detailed|res|resolution)|\d+k|uhd|hdr|absurdres|photo ?realistic|"
+                          r"realistic|raw photo|award[ -]winning.*|official art|newest|amazing quality)$", re.I)
+WEIGHTED = re.compile(r"^\((.*):\s*[-+]?\d*\.?\d+\s*\)$", re.S)
+
+
+def split_prompt(prompt):
+    """Comma-separated parts, ignoring commas inside (), [] and <>."""
+    parts, depth, cur = [], 0, ""
+    for ch in prompt or "":
+        if ch in "([<{":
+            depth += 1
+        elif ch in ")]>}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def unweighted(part):
+    """'(cat:1.2)' / '((cat))' -> 'cat'."""
+    p = part.strip()
+    while True:
+        m = WEIGHTED.match(p)
+        if m:
+            p = m.group(1).strip()
+        elif len(p) > 1 and p[0] + p[-1] in ("()", "[]"):
+            p = p[1:-1].strip()
+        else:
+            return p
+
+
+def auto_subject(prompt):
+    """The first part of the prompt that isn't a quality tag or a LoRA/embedding tag, minus a/an/the."""
+    for part in split_prompt(prompt):
+        core = unweighted(part)
+        if not core or core.startswith("<") or core.lower().startswith("embedding:") or QUALITY_TAGS.match(core):
+            continue
+        return re.sub(r"^(a|an|the|one)\s+", "", core, flags=re.I)
+    return ""
+
+
+def deweight(prompt, subject, weight):
+    """The prompt with every part mentioning the subject re-weighted to `weight` (0 drops it).
+    subject: comma-separated terms; empty = auto (first real part of the prompt); 'none' = off."""
+    subject = (subject or "").strip()
+    if subject.lower() == "none":
+        return prompt or ""
+    terms = [t for t in (unweighted(s) for s in split_prompt(subject)) if t] if subject else \
+        [t for t in [auto_subject(prompt)] if t]
+    if not terms or weight == 1.0:
+        return prompt or ""
+    pats = [re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)", re.I) for t in terms]
+    out = []
+    for part in split_prompt(prompt):
+        core = unweighted(part)
+        if any(p.search(core) for p in pats):
+            if weight > 0:
+                out.append(f"({core}:{round(weight, 2):g})")
+            continue
+        out.append(part)
+    return ", ".join(out)
+
+
 def _image_files():
     input_dir = folder_paths.get_input_directory()
     files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
@@ -118,9 +195,9 @@ def _image_files():
 class ImageRecall:
     CATEGORY = "loaders"
     RETURN_TYPES = ("MODEL", "CLIP", "VAE", "IMAGE", "STRING", "STRING", "INT", "INT", "FLOAT",
-                    comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "STRING")
+                    comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "STRING", "STRING")
     RETURN_NAMES = ("model", "clip", "vae", "image", "positive", "negative", "seed", "steps", "cfg",
-                    "sampler_name", "scheduler", "info")
+                    "sampler_name", "scheduler", "info", "outpaint_positive")
     FUNCTION = "load"
     DESCRIPTION = ("Drop an image on this node: it loads the checkpoint and LoRAs the image was made "
                    "with and outputs its prompts and sampler settings. Reads Tagged Image Saver, "
@@ -147,6 +224,13 @@ class ImageRecall:
                                                "tooltip": "Replaces the recalled prompt when not empty."}),
                 "negative_override": ("STRING", {"default": "", "multiline": True,
                                                  "tooltip": "Replaces the recalled negative when not empty."}),
+                "subject": ("STRING", {"default": "",
+                                       "tooltip": "Main object of the picture (e.g. 'cat', or 'cat, kitten'). "
+                                                  "Weighted down in outpaint_positive so the new area doesn't "
+                                                  "repeat it. Empty = first part of the prompt; 'none' = off."}),
+                "subject_weight": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.5, "step": 0.05,
+                                             "tooltip": "Subject weight in outpaint_positive. 0 removes it, "
+                                                        "1 leaves the prompt as is."}),
             },
         }
 
@@ -158,13 +242,13 @@ class ImageRecall:
         return m.hexdigest()
 
     @classmethod
-    def VALIDATE_INPUTS(cls, image, **_):
+    def VALIDATE_INPUTS(cls, image):  # no **kwargs: ComfyUI still checks the other inputs itself
         if not folder_paths.exists_annotated_filepath(image):
             return f"Invalid image file: {image}"
         return True
 
     def load(self, image, checkpoint, apply_loras, lora_scale, prompt_prefix, prompt_override,
-             negative_override):
+             negative_override, subject="", subject_weight=0.4):
         path = folder_paths.get_annotated_filepath(image)
         r = rc.recall_file(path)
         ckpt, loras, notes = plan(r, checkpoint, apply_loras, lora_scale)
@@ -177,9 +261,10 @@ class ImageRecall:
         img = nodes.LoadImage().load_image(image)[0]
         positive, negative = texts(r, prompt_prefix, prompt_override, negative_override)
         seed, steps, cfg, sampler, scheduler = settings(r)
-        info = rc.describe(r, notes)
+        outpaint = outpaint_text(r, prompt_prefix, prompt_override, subject, subject_weight)
+        info = rc.describe(r, notes) + f"\nOutpaint area prompt: {outpaint or '(none)'}"
         log.info("Image Recall %s: %s + %d LoRA(s)", image, ckpt, len(loras))
-        return (model, clip, vae, img, positive, negative, seed, steps, cfg, sampler, scheduler, info)
+        return (model, clip, vae, img, positive, negative, seed, steps, cfg, sampler, scheduler, info, outpaint)
 
 
 # --- Outpaint Canvas ------------------------------------------------------
@@ -199,10 +284,11 @@ def layout(src_w, src_h, aspect, anchor, upscale_by):
     """Where the source goes on the SDXL canvas and the exact-ratio final size."""
     W, H = BUCKETS[aspect]
     s = min(W / src_w, H / src_h)
-    w, h = min(W, int(round(src_w * s))), min(H, int(round(src_h * s)))
+    # snapped to the 8 px latent grid so the seam falls on latent cell edges
+    w, h = min(W, round8(src_w * s)), min(H, round8(src_h * s))
     fx, fy = W - w, H - h
-    x = 0 if anchor == "left" else fx if anchor == "right" else fx // 2
-    y = 0 if anchor == "top" else fy if anchor == "bottom" else fy // 2
+    x = 0 if anchor == "left" else fx if anchor == "right" else fx // 16 * 8
+    y = 0 if anchor == "top" else fy if anchor == "bottom" else fy // 16 * 8
     a, b = (int(n) for n in aspect.split(":"))
     if W >= H:
         final_w = round8(W * upscale_by)
@@ -305,11 +391,14 @@ class TiledRefine:
             "negative": ("CONDITIONING",),
             "vae": ("VAE",),
             "image": ("IMAGE",),
-            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            "steps": ("INT", {"default": 25, "min": 1, "max": 200}),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+            "steps": ("INT", {"default": 10, "min": 1, "max": 200,
+                              "tooltip": "Steps per tile. Every step runs even at low denoise, so the "
+                                         "total cost is tiles x steps (6 tiles at 2688x1512)."}),
             "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.1, "round": 0.01}),
-            "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
-            "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+            "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "dpmpp_2m",
+                             "tooltip": "Prefer a 1-call-per-step sampler; *_2s_* and sde samplers cost double."}),
+            "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "karras"}),
             "denoise": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
                                   "tooltip": "0.2 keeps it closer to the upscale, 0.4 adds more detail."}),
             "tile_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
@@ -323,16 +412,25 @@ class TiledRefine:
         xs, ys = tile_spans(W, tile_size, overlap), tile_spans(H, tile_size, overlap)
         acc = torch.zeros((B, H, W, 3), dtype=torch.float32)
         wsum = torch.zeros((1, H, W, 1), dtype=torch.float32)
-        pbar = comfy.utils.ProgressBar(len(xs) * len(ys))
+        n_tiles = len(xs) * len(ys)
+        total = n_tiles * steps
+        log.info("Tiled Refine: %d tiles (%dx%d) x %d steps = %d sampler steps", n_tiles, len(xs), len(ys),
+                 steps, total)
+        pbar = comfy.utils.ProgressBar(total)  # one bar for the whole node, not one per tile
         index = 0
         for y, th in ys:
             for x, tw in xs:
                 comfy.model_management.throw_exception_if_processing_interrupted()
                 tile = image[:, y:y + th, x:x + tw, :3]
-                latent = {"samples": vae.encode(tile)}
-                out = nodes.common_ksampler(model, seed + index, steps, cfg, sampler_name, scheduler,
-                                            positive, negative, latent, denoise=denoise)[0]
-                decoded = vae.decode(out["samples"])
+                log.info("Tiled Refine: tile %d/%d", index + 1, n_tiles)
+                latent = comfy.sample.fix_empty_latent_channels(model, vae.encode(tile))
+                noise = comfy.sample.prepare_noise(latent, seed + index)
+                done = index * steps
+                cb = lambda step, x0, x, total_steps, done=done: pbar.update_absolute(done + step + 1, total)
+                samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative,
+                                              latent, denoise=denoise, callback=cb, disable_pbar=True,
+                                              seed=seed + index)
+                decoded = vae.decode(samples)
                 if decoded.dim() == 5:
                     decoded = decoded.reshape(-1, *decoded.shape[-3:])
                 decoded = decoded[:, :th, :tw, :3].float().cpu()
@@ -341,7 +439,6 @@ class TiledRefine:
                 acc[:, y:y + th, x:x + tw] += decoded * weight
                 wsum[:, y:y + th, x:x + tw] += weight
                 index += 1
-                pbar.update(1)
         return ((acc / wsum).clamp(0, 1).to(image.dtype),)
 
 
@@ -376,6 +473,9 @@ def _on_prompt(json_data):
                 pos, neg = texts(r, *strings)
                 meta = node.setdefault("_meta", {})
                 meta["output_texts"] = {"4": pos, "5": neg}
+                subj, sw = literal("subject", ""), literal("subject_weight", 0.4)
+                if isinstance(subj, str) and isinstance(sw, (int, float)):
+                    meta["output_texts"]["12"] = outpaint_text(r, strings[0], strings[1], subj, float(sw))
     except Exception as e:  # never block a queue over metadata
         log.warning("Image Recall: could not record metadata: %s", e)
     return json_data
@@ -395,7 +495,17 @@ try:
             r = rc.recall_file(path)
             _, _, notes = plan(r, request.query.get("checkpoint", FROM_IMAGE),
                                request.query.get("apply_loras", "true") != "false")
-            return web.json_response({"text": rc.describe(r, notes), "found": bool(r["sources"])})
+            text = rc.describe(r, notes)
+            q = request.query
+            if r["sources"]:
+                try:
+                    sw = float(q.get("subject_weight", 0.4))
+                except ValueError:
+                    sw = 0.4
+                text += "\nOutpaint area prompt: " + (outpaint_text(
+                    r, q.get("prompt_prefix", ""), q.get("prompt_override", ""), q.get("subject", ""), sw)
+                    or "(none)")
+            return web.json_response({"text": text, "found": bool(r["sources"])})
         except Exception as e:
             return web.json_response({"text": f"Could not read {name}: {e}"}, status=400)
 
