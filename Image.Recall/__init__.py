@@ -338,12 +338,22 @@ def round8(v):
     return max(8, int(round(v / 8.0)) * 8)
 
 
-def layout(src_w, src_h, aspect, anchor, upscale_by):
-    """Where the source goes on the SDXL canvas and the exact-ratio final size."""
+def layout(src_w, src_h, aspect, anchor, upscale_by, rw=0, rh=0):
+    """Where the source goes on the SDXL canvas and the exact-ratio final size.
+    rw/rh: resize the source to this first (0 = fit the canvas; one 0 = keep the ratio)."""
     W, H = BUCKETS[aspect]
-    s = min(W / src_w, H / src_h)
+    rw, rh = int(rw or 0), int(rh or 0)
+    if rw > 0 and rh > 0:
+        tw, th = rw, rh
+    elif rw > 0:
+        tw, th = rw, rw * src_h / src_w
+    elif rh > 0:
+        tw, th = rh * src_w / src_h, rh
+    else:
+        tw, th = src_w * 1e9, src_h * 1e9  # no size asked: fit the canvas
+    s = min(1.0, W / tw, H / th)  # never larger than the canvas
     # snapped to the 8 px latent grid so the seam falls on latent cell edges
-    w, h = min(W, round8(src_w * s)), min(H, round8(src_h * s))
+    w, h = min(W, round8(tw * s)), min(H, round8(th * s))
     fx, fy = W - w, H - h
     x = 0 if anchor == "left" else fx if anchor == "right" else fx // 16 * 8
     y = 0 if anchor == "top" else fy if anchor == "bottom" else fy // 16 * 8
@@ -357,9 +367,10 @@ def layout(src_w, src_h, aspect, anchor, upscale_by):
     return {"W": W, "H": H, "x": x, "y": y, "w": w, "h": h, "final_w": final_w, "final_h": final_h}
 
 
-def outpaint_mask(L, feather):
+def outpaint_mask(L, feather, repaint=0.0):
     """1 where new content is generated, 0 over the source; ramps into the source
-    along every edge that borders new area."""
+    along every edge that borders new area. repaint lifts the source's floor from 0
+    (kept) toward 1 (fully redrawn), so the new scene can take over the source."""
     W, H, x, y, w, h = L["W"], L["H"], L["x"], L["y"], L["w"], L["h"]
     mask = torch.ones((H, W), dtype=torch.float32)
     inner = torch.zeros((h, w), dtype=torch.float32)
@@ -375,6 +386,9 @@ def outpaint_mask(L, feather):
             inner = torch.maximum(inner, ramp(ys).expand(h, w))
         if y + h < H:
             inner = torch.maximum(inner, ramp(h - 1 - ys).expand(h, w))
+    repaint = min(1.0, max(0.0, float(repaint)))
+    if repaint > 0:
+        inner = repaint + (1.0 - repaint) * inner
     mask[y:y + h, x:x + w] = inner
     return mask
 
@@ -395,19 +409,29 @@ class OutpaintCanvas:
             "anchor": (ANCHORS, {"default": "center",
                                  "tooltip": "Where the original sits. left = extend to the right, "
                                             "center = extend both sides."}),
-            "feather": ("INT", {"default": 48, "min": 0, "max": 256, "step": 8,
+            "feather": ("INT", {"default": 48, "min": 0, "max": 1024, "step": 8,
                                 "tooltip": "Pixels of the original blended into the new area."}),
             "upscale_by": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.25,
                                      "tooltip": "Final size = canvas x this, trimmed to the exact ratio."}),
+        }, "optional": {
+            "resize_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                     "tooltip": "Resize the image to this width before outpainting. 0 = fit the "
+                                                "canvas (or keep the ratio if only height is set)."}),
+            "resize_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                      "tooltip": "Resize the image to this height before outpainting. 0 = fit the "
+                                                 "canvas (or keep the ratio if only width is set)."}),
+            "repaint_original": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                           "tooltip": "How much of the original itself is redrawn: 0 = kept as is, "
+                                                      "0.5 = like img2img at 0.5, 1 = replaced by the new scene."}),
         }}
 
-    def build(self, image, aspect, anchor, feather, upscale_by):
-        L = layout(image.shape[2], image.shape[1], aspect, anchor, upscale_by)
+    def build(self, image, aspect, anchor, feather, upscale_by, resize_width=0, resize_height=0, repaint_original=0.0):
+        L = layout(image.shape[2], image.shape[1], aspect, anchor, upscale_by, resize_width, resize_height)
         src = comfy.utils.common_upscale(image.movedim(-1, 1)[:, :3], L["w"], L["h"], "lanczos",
                                          "disabled").movedim(1, -1).clamp(0, 1)
         canvas = torch.full((image.shape[0], L["H"], L["W"], 3), 0.5, dtype=src.dtype, device=src.device)
         canvas[:, L["y"]:L["y"] + L["h"], L["x"]:L["x"] + L["w"], :] = src
-        mask = outpaint_mask(L, feather).unsqueeze(0).to(src.device)
+        mask = outpaint_mask(L, feather, repaint_original).unsqueeze(0).to(src.device)
         return (canvas, mask, L["W"], L["H"], L["final_w"], L["final_h"])
 
 
@@ -538,6 +562,7 @@ try:
                 "found": bool(r["sources"]), "sources": r["sources"], "notes": notes, "size": r.get("size"),
                 "checkpoint": ckpt or "", "checkpoint_recorded": r.get("checkpoint") or "",
                 "loras": loras, "positive": r.get("positive") or "", "negative": r.get("negative") or "",
+                "lora_tags": r.get("lora_tags"),
                 "outpaint_positive": outpaint_text(r, q.get("prompt_prefix", ""), "", q.get("subject", ""), sw),
                 "seed": seed, "steps": steps, "cfg": cfg, "sampler": sampler, "scheduler": scheduler,
                 "choices": {"checkpoints": folder_paths.get_filename_list("checkpoints"),

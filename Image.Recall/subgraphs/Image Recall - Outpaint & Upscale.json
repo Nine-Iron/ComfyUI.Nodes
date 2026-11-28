@@ -42,8 +42,8 @@
     "version": 1,
     "state": {
      "lastGroupId": 0,
-     "lastNodeId": 20,
-     "lastLinkId": 52,
+     "lastNodeId": 21,
+     "lastLinkId": 55,
      "lastRerouteId": 0
     },
     "revision": 0,
@@ -74,7 +74,7 @@
       "name": "image",
       "type": "IMAGE",
       "linkIds": [
-       52
+       55
       ],
       "localized_name": "image",
       "label": "image",
@@ -108,7 +108,8 @@
         "type": "MODEL",
         "links": [
          1,
-         35
+         35,
+         52
         ]
        },
        {
@@ -117,7 +118,8 @@
         "type": "CLIP",
         "links": [
          2,
-         4
+         4,
+         53
         ]
        },
        {
@@ -209,7 +211,7 @@
         "name": "outpaint_positive",
         "type": "STRING",
         "links": [
-         3
+         54
         ]
        },
        {
@@ -237,7 +239,7 @@
        "(from image)",
        true,
        1.0,
-       "wide shot",
+       "",
        "",
        "",
        "",
@@ -460,7 +462,10 @@
        "16:9",
        "center",
        48,
-       1.0
+       1.0,
+       0,
+       0,
+       0.0
       ]
      },
      {
@@ -1263,7 +1268,7 @@
         "type": "*",
         "links": [
          51,
-         52
+         55
         ]
        }
       ],
@@ -1323,6 +1328,82 @@
        "",
        "essentials + workflow"
       ]
+     },
+     {
+      "id": 21,
+      "type": "LoraTagPicker",
+      "pos": [
+       460,
+       -420
+      ],
+      "size": [
+       400,
+       360
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+       {
+        "localized_name": "model",
+        "name": "model",
+        "type": "MODEL",
+        "link": 52
+       },
+       {
+        "localized_name": "clip",
+        "name": "clip",
+        "type": "CLIP",
+        "link": 53
+       },
+       {
+        "localized_name": "text",
+        "name": "text",
+        "type": "STRING",
+        "link": 54,
+        "widget": {
+         "name": "text"
+        }
+       }
+      ],
+      "outputs": [
+       {
+        "localized_name": "model",
+        "name": "model",
+        "type": "MODEL",
+        "links": []
+       },
+       {
+        "localized_name": "clip",
+        "name": "clip",
+        "type": "CLIP",
+        "links": []
+       },
+       {
+        "localized_name": "text",
+        "name": "text",
+        "type": "STRING",
+        "links": [
+         3
+        ]
+       },
+       {
+        "localized_name": "tags",
+        "name": "tags",
+        "type": "STRING",
+        "links": []
+       }
+      ],
+      "properties": {
+       "Node name for S&R": "LoraTagPicker"
+      },
+      "widgets_values": [
+       "",
+       "after prompt",
+       "{\"v\":1,\"overrides\":{}}",
+       8
+      ],
+      "title": "LoRA tags"
      }
     ],
     "groups": [],
@@ -1345,8 +1426,8 @@
      },
      {
       "id": 3,
-      "origin_id": 1,
-      "origin_slot": 12,
+      "origin_id": 21,
+      "origin_slot": 2,
       "target_id": 3,
       "target_slot": 1,
       "type": "STRING"
@@ -1737,6 +1818,30 @@
      },
      {
       "id": 52,
+      "origin_id": 1,
+      "origin_slot": 0,
+      "target_id": 21,
+      "target_slot": 0,
+      "type": "MODEL"
+     },
+     {
+      "id": 53,
+      "origin_id": 1,
+      "origin_slot": 1,
+      "target_id": 21,
+      "target_slot": 1,
+      "type": "CLIP"
+     },
+     {
+      "id": 54,
+      "origin_id": 1,
+      "origin_slot": 12,
+      "target_id": 21,
+      "target_slot": 2,
+      "type": "STRING"
+     },
+     {
+      "id": 55,
       "origin_id": 19,
       "origin_slot": 0,
       "target_id": -20,

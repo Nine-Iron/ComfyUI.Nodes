@@ -79,6 +79,14 @@ function fetchInfo(name) {
 // ---------------------------------------------------------- graph walk
 
 function lorasOnNode(node) {
+  if (node.type === "ImageRecall") {
+    // Image Recall loads the LoRAs ticked in its settings panel (JSON in its "settings" widget).
+    let settings = null;
+    try { settings = JSON.parse(node.widgets?.find((w) => w.name === "settings")?.value || "{}"); } catch { settings = null; }
+    return (settings?.loras ?? [])
+      .filter((l) => l && typeof l.name === "string" && l.on !== false)
+      .map((l) => l.name);
+  }
   if (!node.outputs?.some((o) => o.type === "MODEL" || o.type === "CLIP")) return [];
   const names = [];
   for (const widget of node.widgets ?? []) {

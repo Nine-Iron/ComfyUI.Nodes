@@ -357,6 +357,19 @@ def auto_tags(tags, max_tags):
 
 # ------------------------------------------------------------ graph walk
 
+def _image_recall_loras(node):
+    """LoRAs an Image Recall node loads: the ticked ones in its settings panel's JSON."""
+    if not isinstance(node, dict) or node.get("class_type") != "ImageRecall":
+        return []
+    try:
+        settings = json.loads((node.get("inputs") or {}).get("settings") or "{}")
+    except (TypeError, ValueError):
+        return []
+    loras = settings.get("loras") if isinstance(settings, dict) else None
+    return [l["name"] for l in loras or [] if isinstance(l, dict) and isinstance(l.get("name"), str)
+            and l.get("on", True) is not False]
+
+
 def find_upstream_loras(prompt, unique_id):
     """LoRA files loaded upstream of a node, in load order (furthest upstream first).
 
@@ -390,6 +403,9 @@ def find_upstream_loras(prompt, unique_id):
 
     found = []
     for nid, node_depth in depth_of.items():
+        for name in _image_recall_loras(prompt.get(nid)):
+            if name in known:
+                found.append((node_depth, len(found), name))
         for key, value in inputs_of(nid).items():
             if "lora" not in str(key).lower():
                 continue

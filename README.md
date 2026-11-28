@@ -44,7 +44,7 @@ cp -r Lora.Tag.Picker     ~/ComfyUI/custom_nodes/
 cp -r Prompt.Generator    ~/ComfyUI/custom_nodes/
 cp -r Model.Preview.Popup ~/ComfyUI/custom_nodes/
 cp -r Checkpoint.Sweep Sampler.Sweep Lora.Sweep ~/ComfyUI/custom_nodes/
-cp -r Image.Recall Tagged.Image.Saver ~/ComfyUI/custom_nodes/
+cp -r Image.Recall Tagged.Image.Saver Lora.Tag.Picker ~/ComfyUI/custom_nodes/   # the Image Recall subgraph uses all three
 ```
 
 To pick up updates with a `git pull`, symlink instead of copying:
@@ -250,7 +250,7 @@ Every new model is a full load, which takes a while on small machines such as a 
 
 ## Image Recall
 
-Drop an image anywhere in the ComfyUI window and get back what made it. The **Image Recall - Outpaint & Upscale** subgraph reads the checkpoint, LoRAs, prompts, seed, steps, cfg and sampler from the image. It lists them all on the node, where you can change any of them, then outpaints the image, upscales it, or both.
+Drop an image anywhere in the ComfyUI window and get back what made it. The subgraph needs `Tagged.Image.Saver` and `Lora.Tag.Picker` installed too. The **Image Recall - Outpaint & Upscale** subgraph reads the checkpoint, LoRAs, prompts, seed, steps, cfg and sampler from the image. It lists them all on the node, where you can change any of them, then outpaints the image, upscales it, or both.
 
 ### Usage
 
@@ -262,12 +262,19 @@ Drop an image anywhere in the ComfyUI window and get back what made it. The **Im
    - mode
    - checkpoint
    - each LoRA: on/off, model and clip strength, remove, add
+   - **LoRA tags**: each ticked LoRA's tags as chips. Click a chip to add that tag to the prompt; the first 3 triggers start on. Choose whether tags go before or after the prompt. This is LoRA Tag Picker, running inside the subgraph.
    - prompt, negative, subject and its weight
-   - seed, steps, cfg, sampler, scheduler
+   - seed, steps, cfg, sampler, scheduler. Next to the seed: 🎲 picks a new random seed now, and **after each run** chooses what happens to it once a run is queued: `fixed` (default), `increment`, `decrement` or `randomize`, the same as ComfyUI's control after generate.
    - aspect, where the original sits, feather
-   - upscale long side, steps, denoise
+   - **Resize to** width × height: shrinks the original before outpainting, so more of the canvas is new (for example 640 × 640 on a 1344x768 canvas). `0` = fit the canvas; with one box at `0`, that side follows the image's ratio. The panel shows the resulting size.
+   - **Blend** slider (Step 1): from *keep picture* to *scene eats it*. The left part (up to 70) widens the feather from 8 px to half the picture, so the new scene blends further into it. Past 70 the picture itself is redrawn too, up to 85% at the far right (like img2img at 0.85). The line under it shows the resulting feather and how much of the picture is redrawn.
+   - upscale **Shape**: *auto* (in upscale mode the picture's own shape, otherwise the outpaint aspect), the picture's own shape, or a fixed ratio such as 16:9, with **stretch** or **crop** to fit. Plus long side, steps, denoise
 
    **Reset to image** reloads the image's own values.
+
+   **Lock settings** (the checkbox on the Mode row) keeps every setting as it is when you import another image: only the picture changes. It is saved with the workflow. **Reset to image** still works while it's on.
+
+   **History** lists every image you've imported as thumbnails, each with the settings it was last used with. Click a thumbnail to load it with those settings (with Lock on, only the picture changes). Hover a thumbnail and click its **✕** to remove it from the history; the file stays in `ComfyUI/input`. Ctrl+mouse wheel over the thumbnails resizes them. The history is saved in `ComfyUI/user/default/image_recall_history.json`. Different images dropped with the same file name are now saved side by side (`image (1).png`) instead of replacing each other.
 4. Queue.
 
 | Mode | What runs | Cost (normal render = one 1024x1024 at the image's steps) |
@@ -279,6 +286,35 @@ Drop an image anywhere in the ComfyUI window and get back what made it. The **Im
 The parts the mode doesn't use don't run at all: the subgraph picks its path with lazy If/Else switches.
 
 The panel's **Estimate** shows these numbers for your settings before you queue. After a run on this machine it adds minutes, timed from the progress bar. Every step runs whatever the denoise. Samplers such as `dpmpp_2s_ancestral`, `dpmpp_sde` and `heun` make 2 model calls per step, and the panel warns about them. On an 8 GB machine, many LoRAs also slow every step down.
+
+### Mixing two pictures
+
+Take one image's recipe (checkpoint, LoRAs, prompt, seed, sampler) and apply it to another picture's pixels. **Lock settings** does the work: drop the image whose look you want, tick Lock, then drop the picture to use. With Lock on, the panel ignores the dropped picture's own metadata; downloaded images often have none.
+
+**A. Restyle a picture with another image's recipe**
+1. **Mode**: `upscale`. Set it before dropping, because the prompt is filled in for the mode that's set at the time.
+2. Drop the image whose look you want.
+3. Tick **Lock settings**.
+4. Drop the picture to restyle.
+5. Step 2 **Shape**:
+   - `16:9` with **stretch** gives a full 1920x1080.
+   - *auto* keeps the picture's own shape.
+6. Queue. About 2 normal renders.
+
+**B. Put a picture in the middle of a new scene made with another image's recipe**
+1. **Mode**: `outpaint + upscale`.
+2. Drop the image whose look you want.
+3. **Subject**: `none`. This keeps its prompt exactly, instead of weighting its subject down.
+4. Step 1:
+   - **Aspect** `16:9`, **Original at** `center`.
+   - **Resize to**, e.g. `768 × 386`: the smaller the picture, the more of the canvas is new scene.
+5. Tick **Lock settings**.
+6. Drop the picture to place.
+7. **Blend**:
+   - About 45 gives a soft edge (feather about 128 px).
+   - Slide left to keep more of the picture.
+   - Slide right to let the scene take it over. Past 70 the picture itself is redrawn too.
+8. Queue. About 3 normal renders.
 
 ### Image Recall (loaders)
 
@@ -307,8 +343,10 @@ When queued, it writes the resolved checkpoint, LoRAs and settings into its own 
 | --- | --- | --- |
 | `aspect` | `16:9` | `16:9 9:16 21:9 9:21 4:3 3:4 3:2 2:3 1:1`. The canvas is SDXL's bucket for it: 1344x768, 1536x640, 1152x896, 1216x832, 1024x1024 (and portrait). |
 | `anchor` | `center` | Where the original sits: `center` grows both sides, `left` grows to the right, `top` grows downward, and so on. |
-| `feather` | `48` | Pixels of the original blended into the new area. |
+| `feather` | `48` | Pixels of the original blended into the new area (0–1024). |
 | `upscale_by` | `2.0` | Sets `final_width` / `final_height`: the canvas times this, trimmed to the exact ratio. |
+| `resize_width`, `resize_height` | `0` | Resize the original to this size before placing it. `0` = fit the canvas; with only one set, the other follows the image's ratio. Never larger than the canvas. |
+| `repaint_original` | `0.0` | How much of the original itself is redrawn: `0` = kept, `0.5` = like img2img at 0.5, `1` = replaced by the new scene. |
 
 Outputs `canvas` (the original scaled onto a gray canvas), `mask` (1 = generate), `width`, `height`, `final_width`, `final_height`.
 

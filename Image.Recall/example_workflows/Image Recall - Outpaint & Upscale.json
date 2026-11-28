@@ -41,8 +41,8 @@
     0
    ],
    "size": [
-    520,
-    520
+    620,
+    980
    ],
    "flags": {},
    "order": 1,
@@ -52,7 +52,7 @@
    "title": "How to use",
    "properties": {},
    "widgets_values": [
-    "Image Recall - Outpaint & Upscale\n\n1. Drop an image anywhere in this window (hold Shift while dropping to load its workflow instead).\n2. The panel on the node fills in everything the image recorded: checkpoint, LoRAs, prompt, negative, seed, steps, cfg, sampler. Change anything right there.\n3. Pick the mode:\n   - outpaint: grow the picture to the chosen aspect at SDXL size (1344x768 for 16:9). About one normal render.\n   - outpaint + upscale: then one SDXL pass at the final size (1920x1088, cropped to 1920x1080). About 3 normal renders in total.\n   - upscale: only the upscale pass on the original. About 2 normal renders.\n4. Queue. The panel's Estimate shows the cost before you run, and minutes once it has timed a run.\n\nSpeed on 8 GB: every step runs whatever the denoise; *_2s_* / sde samplers cost 2 model calls per step; many LoRAs slow everything. Untick LoRAs you don't need."
+    "Image Recall - Outpaint & Upscale\n\n1. Drop an image anywhere in this window (hold Shift while dropping to load its workflow instead).\n2. The panel on the node fills in everything the image recorded: checkpoint, LoRAs, prompt, negative, seed, steps, cfg, sampler. Change anything right there.\n3. Pick the mode:\n   - outpaint: grow the picture to the chosen aspect at SDXL size (1344x768 for 16:9). About one normal render.\n   - outpaint + upscale: then one SDXL pass at the final size (1920x1088, cropped to 1920x1080). About 3 normal renders in total.\n   - upscale: only the upscale pass on the original. About 2 normal renders.\n4. Queue. The panel's Estimate shows the cost before you run, and minutes once it has timed a run.\n\nLoRA tags: click a LoRA's tags in the panel to add them to the prompt (the first 3 triggers start on).\nResize: Step 1's width/height boxes shrink the original before outpainting (0 = fit the canvas).\n\nSeed: the dice picks a new seed now; \"after each run\" = fixed / increment / decrement / randomize.\nBlend slider (Step 1): left = keep the picture, right = the new scene eats it (past 70 it redraws the picture too).\nUpscale Shape (Step 2): auto, the picture's own shape, or a fixed ratio, with stretch or crop to fit.\nHistory: thumbnails of every image you've dropped, with their settings. Click = load, X = remove, Ctrl+wheel = size.\n\nMIXING TWO PICTURES (one picture's settings, another picture's pixels)\nLock settings (on the Mode row) keeps every setting when you drop another image; only the picture changes.\n\nA. Restyle a picture with another image's recipe:\n   1. Mode: upscale.  2. Drop the image whose look you want.  3. Tick Lock settings.\n   4. Drop the picture to restyle.  5. Step 2 Shape: 16:9 + stretch for a full 1920x1080, or auto to keep its shape.  6. Queue (about 2 renders).\n\nB. Put a picture in the middle of a new scene made with another image's recipe:\n   1. Mode: outpaint + upscale.  2. Drop the image whose look you want.  3. Subject: none (keeps its prompt exactly).\n   4. Step 1: Aspect 16:9, Original at center, Resize to e.g. 768 x 386 (smaller = more new scene).\n   5. Tick Lock settings.  6. Drop the picture to place.\n   7. Blend: about 45 for a soft edge; slide left to keep more of the picture, right to let the scene take it over.\n   8. Queue (about 3 renders).\n\nWith Lock on, the panel ignores the dropped picture's own metadata; downloaded images often have none.\n\nSpeed on 8 GB: every step runs whatever the denoise; *_2s_* / sde samplers cost 2 model calls per step; many LoRAs slow everything. Untick LoRAs you don't need."
    ],
    "color": "#432",
    "bgcolor": "#653"
@@ -78,8 +78,8 @@
     "version": 1,
     "state": {
      "lastGroupId": 0,
-     "lastNodeId": 20,
-     "lastLinkId": 52,
+     "lastNodeId": 21,
+     "lastLinkId": 55,
      "lastRerouteId": 0
     },
     "revision": 0,
@@ -110,7 +110,7 @@
       "name": "image",
       "type": "IMAGE",
       "linkIds": [
-       52
+       55
       ],
       "localized_name": "image",
       "label": "image",
@@ -144,7 +144,8 @@
         "type": "MODEL",
         "links": [
          1,
-         35
+         35,
+         52
         ]
        },
        {
@@ -153,7 +154,8 @@
         "type": "CLIP",
         "links": [
          2,
-         4
+         4,
+         53
         ]
        },
        {
@@ -245,7 +247,7 @@
         "name": "outpaint_positive",
         "type": "STRING",
         "links": [
-         3
+         54
         ]
        },
        {
@@ -273,7 +275,7 @@
        "(from image)",
        true,
        1.0,
-       "wide shot",
+       "",
        "",
        "",
        "",
@@ -496,7 +498,10 @@
        "16:9",
        "center",
        48,
-       1.0
+       1.0,
+       0,
+       0,
+       0.0
       ]
      },
      {
@@ -1299,7 +1304,7 @@
         "type": "*",
         "links": [
          51,
-         52
+         55
         ]
        }
       ],
@@ -1359,6 +1364,82 @@
        "",
        "essentials + workflow"
       ]
+     },
+     {
+      "id": 21,
+      "type": "LoraTagPicker",
+      "pos": [
+       460,
+       -420
+      ],
+      "size": [
+       400,
+       360
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+       {
+        "localized_name": "model",
+        "name": "model",
+        "type": "MODEL",
+        "link": 52
+       },
+       {
+        "localized_name": "clip",
+        "name": "clip",
+        "type": "CLIP",
+        "link": 53
+       },
+       {
+        "localized_name": "text",
+        "name": "text",
+        "type": "STRING",
+        "link": 54,
+        "widget": {
+         "name": "text"
+        }
+       }
+      ],
+      "outputs": [
+       {
+        "localized_name": "model",
+        "name": "model",
+        "type": "MODEL",
+        "links": []
+       },
+       {
+        "localized_name": "clip",
+        "name": "clip",
+        "type": "CLIP",
+        "links": []
+       },
+       {
+        "localized_name": "text",
+        "name": "text",
+        "type": "STRING",
+        "links": [
+         3
+        ]
+       },
+       {
+        "localized_name": "tags",
+        "name": "tags",
+        "type": "STRING",
+        "links": []
+       }
+      ],
+      "properties": {
+       "Node name for S&R": "LoraTagPicker"
+      },
+      "widgets_values": [
+       "",
+       "after prompt",
+       "{\"v\":1,\"overrides\":{}}",
+       8
+      ],
+      "title": "LoRA tags"
      }
     ],
     "groups": [],
@@ -1381,8 +1462,8 @@
      },
      {
       "id": 3,
-      "origin_id": 1,
-      "origin_slot": 12,
+      "origin_id": 21,
+      "origin_slot": 2,
       "target_id": 3,
       "target_slot": 1,
       "type": "STRING"
@@ -1773,6 +1854,30 @@
      },
      {
       "id": 52,
+      "origin_id": 1,
+      "origin_slot": 0,
+      "target_id": 21,
+      "target_slot": 0,
+      "type": "MODEL"
+     },
+     {
+      "id": 53,
+      "origin_id": 1,
+      "origin_slot": 1,
+      "target_id": 21,
+      "target_slot": 1,
+      "type": "CLIP"
+     },
+     {
+      "id": 54,
+      "origin_id": 1,
+      "origin_slot": 12,
+      "target_id": 21,
+      "target_slot": 2,
+      "type": "STRING"
+     },
+     {
+      "id": 55,
       "origin_id": 19,
       "origin_slot": 0,
       "target_id": -20,

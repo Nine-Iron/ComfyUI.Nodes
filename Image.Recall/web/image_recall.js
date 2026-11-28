@@ -16,6 +16,8 @@ const BUCKETS = { "16:9": [1344, 768], "9:16": [768, 1344], "21:9": [1536, 640],
 const TEXT_DEFAULT_H = 60;               // the frontend's default multiline height (px)
 const TEXT_MIN_H = TEXT_DEFAULT_H * 3;   // every text field: at least 3x that
 const SPEED_KEY = "ImageRecall.secPerMPStep";
+const THUMB_KEY = "ImageRecall.thumbSize";
+const HISTORY_FILE = "image_recall_history.json"; // ~/ComfyUI/user/default/image_recall_history.json
 
 // ---------------------------------------------------------------- helpers
 const widget = (node, name) => node?.widgets?.find((w) => w.name === name);
@@ -75,10 +77,47 @@ function callsPerStep(sampler) {
 }
 const ceil64 = (v) => Math.ceil(v / 64) * 64;
 const round8 = (v) => Math.max(8, Math.round(v / 8) * 8);
+// Mirrors layout() in __init__.py: the source's size on the outpaint canvas.
+function placedSize(srcW, srcH, aspect, rw, rh) {
+  const [W, H] = BUCKETS[aspect] ?? [1344, 768];
+  let tw, th;
+  if (rw > 0 && rh > 0) [tw, th] = [rw, rh];
+  else if (rw > 0) [tw, th] = [rw, (rw * srcH) / srcW];
+  else if (rh > 0) [tw, th] = [(rh * srcW) / srcH, rh];
+  else [tw, th] = [srcW * 1e9, srcH * 1e9];
+  const k = Math.min(1, W / tw, H / th);
+  return { w: Math.min(W, round8(tw * k)), h: Math.min(H, round8(th * k)), W, H };
+}
 function upscaleSize(srcW, srcH, aspect, longSide) {
   let [ra, rb] = aspect in BUCKETS ? aspect.split(":").map(Number) : [srcW, srcH];
   const [w, h] = ra >= rb ? [longSide, round8((longSide * rb) / ra)] : [round8((longSide * ra) / rb), longSide];
   return { rw: ceil64(w), rh: ceil64(h), w, h };
+}
+
+// ---------------------------------------------------------------- LoRA tags (via LoRA Tag Picker)
+const PICKER = "LoraTagPicker";
+const AUTO_ON = 3; // same rule as the picker: first 3 triggers up front start on
+const tagCache = new Map();
+async function loraTags(name) {
+  if (!tagCache.has(name)) {
+    tagCache.set(name, api.fetchApi(`/Lora.Tag.Picker/tags?name=${encodeURIComponent(name)}`)
+      .then((r) => (r.ok ? r.json() : { tags: [] }))
+      .catch(() => ({ tags: [] })));
+  }
+  return tagCache.get(name);
+}
+function pickerState(picker) {
+  try {
+    const v = JSON.parse(widget(picker, "selection")?.value || "{}");
+    return { v: 1, overrides: v?.overrides && typeof v.overrides === "object" ? v.overrides : {} };
+  } catch {
+    return { v: 1, overrides: {} };
+  }
+}
+function frontOf(info, maxTags) {
+  const front = (info.tags ?? []).filter((t) => t.tier !== "rare").slice(0, maxTags);
+  const auto = new Set(front.filter((t) => t.tier === "trigger").slice(0, AUTO_ON).map((t) => t.tag));
+  return { front, auto };
 }
 
 // ---------------------------------------------------------------- recall + upload
@@ -108,42 +147,280 @@ function settingsFromRecall(t, r) {
   };
 }
 
+// Turn on exactly the LoRA tags the image's own LoRA Tag Picker used (and its before/after setting).
+// No picker in the image: back to the picker's defaults.
+async function applyRecalledTags(t, r) {
+  const picker = byType(t, PICKER);
+  if (!picker) return;
+  const lt = r.lora_tags;
+  if (!lt?.resolved?.length) {
+    setWidget(picker, "selection", JSON.stringify({ v: 1, overrides: {} }));
+    return;
+  }
+  if (lt.position) setWidget(picker, "tag_position", lt.position);
+  const maxTags = Number(widget(picker, "max_tags")?.value ?? 8);
+  const overrides = {};
+  for (const e of lt.resolved) {
+    const { auto } = frontOf(await loraTags(e.lora), maxTags);
+    const want = new Set(e.tags);
+    const o = {};
+    for (const tag of want) if (!auto.has(tag)) o[tag] = true;
+    for (const tag of auto) if (!want.has(tag)) o[tag] = false;
+    if (Object.keys(o).length) overrides[e.lora] = o;
+  }
+  setWidget(picker, "selection", JSON.stringify({ v: 1, overrides }));
+}
+
 function applyDefaultsForImage(t, r) {
   const s2 = step2(t);
   if (s2) setWidget(s2, "steps", r.steps);
   syncUpscaleAspect(t);
 }
 
+// Step 2's shape: "auto" = the picture's own shape in upscale mode, the outpaint aspect otherwise.
+const UP_AUTO = "auto";
+const upShape = (t) => t.host.properties?.imageRecallUpAspect ?? UP_AUTO;
+const renderScale = (t) => t.nodes.find((n) => n.type === "ImageScale" && /render size/i.test(n.title ?? ""));
 function syncUpscaleAspect(t) {
   const mode = widget(t.recall, "mode")?.value;
   const canvas = byType(t, "OutpaintCanvas");
   const up = byType(t, "UpscaleSize");
-  if (up) setWidget(up, "aspect", mode === "upscale" ? FROM_IMAGE : widget(canvas, "aspect")?.value ?? "16:9");
+  const auto = mode === "upscale" ? FROM_IMAGE : widget(canvas, "aspect")?.value ?? "16:9";
+  if (up) setWidget(up, "aspect", upShape(t) === UP_AUTO ? auto : upShape(t));
+}
+
+// Blend slider (0..100): keep the dropped picture <-> let the generated scene eat it.
+// 0..70 widens the feather from 8 px to half the picture; 70..100 also redraws the picture itself (up to 0.85).
+const BLEND_FEATHER_END = 70;
+const BLEND_REPAINT_MAX = 0.85;
+function blendParams(b, placed) {
+  const maxF = Math.max(8, Math.floor(Math.min(placed.w, placed.h) / 2 / 8) * 8);
+  const f = Math.min(1, b / BLEND_FEATHER_END);
+  const feather = Math.round((8 + (maxF - 8) * f) / 8) * 8;
+  const repaint = b <= BLEND_FEATHER_END ? 0
+    : Math.round(((b - BLEND_FEATHER_END) / (100 - BLEND_FEATHER_END)) * BLEND_REPAINT_MAX * 100) / 100;
+  return { feather, repaint, maxF };
+}
+// Slider position for an existing feather/repaint (workflows saved before the slider existed).
+function blendFrom(feather, repaint, placed) {
+  if (repaint > 0) return BLEND_FEATHER_END + (repaint / BLEND_REPAINT_MAX) * (100 - BLEND_FEATHER_END);
+  const { maxF } = blendParams(0, placed);
+  return Math.max(0, Math.min(BLEND_FEATHER_END, ((feather - 8) / Math.max(1, maxF - 8)) * BLEND_FEATHER_END));
 }
 
 async function uploadImage(file) {
   const body = new FormData();
   body.append("image", file);
-  body.append("overwrite", "true");
   const res = await api.fetchApi("/upload/image", { method: "POST", body });
   if (!res.ok) throw new Error(`upload failed: ${res.status}`);
   const j = await res.json();
   return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
 }
 
-async function loadImageInto(t, filename, { reset }) {
-  setWidget(t.recall, "image", filename);
+// ---------------------------------------------------------------- history + lock
+// History: every imported image with the settings it was last used with, kept in ComfyUI's user data.
+let history = null;
+let historyLoad = null;
+let historySave = null;
+async function loadHistory() {
+  if (history) return history;
+  historyLoad ??= (async () => {
+    try {
+      const res = await api.getUserData(HISTORY_FILE);
+      history = res.ok ? await res.json() : [];
+    } catch {
+      history = [];
+    }
+    if (!Array.isArray(history)) history = [];
+    return history;
+  })();
+  return historyLoad;
+}
+function saveHistory() {
+  clearTimeout(historySave);
+  historySave = setTimeout(() => {
+    api.storeUserData(HISTORY_FILE, history, { overwrite: true, stringify: true, throwOnError: false })
+      .catch((err) => console.warn("Image Recall: could not save history", err));
+  }, 500);
+}
+
+function snapshot(t) {
+  const v = (n, k) => widget(n, k)?.value;
+  const canvas = byType(t, "OutpaintCanvas");
+  const up = byType(t, "UpscaleSize");
+  const s2 = step2(t);
+  const picker = byType(t, PICKER);
+  return {
+    settings: readSettings(t),
+    mode: v(t.recall, "mode"), subject: v(t.recall, "subject"), subject_weight: v(t.recall, "subject_weight"),
+    prompt_prefix: v(t.recall, "prompt_prefix"),
+    canvas: canvas ? { aspect: v(canvas, "aspect"), anchor: v(canvas, "anchor"), feather: v(canvas, "feather"),
+      resize_width: v(canvas, "resize_width"), resize_height: v(canvas, "resize_height"),
+      repaint_original: v(canvas, "repaint_original") } : undefined,
+    upscale: up ? { long_side: v(up, "long_side") } : undefined,
+    render: renderScale(t) ? { crop: v(renderScale(t), "crop") } : undefined,
+    props: { imageRecallBlend: t.host.properties?.imageRecallBlend, imageRecallUpAspect: t.host.properties?.imageRecallUpAspect,
+      imageRecallSeedMode: t.host.properties?.imageRecallSeedMode },
+    step2: s2 ? { steps: v(s2, "steps"), denoise: v(s2, "denoise") } : undefined,
+    tags: picker ? { selection: v(picker, "selection"), tag_position: v(picker, "tag_position") } : undefined,
+  };
+}
+function restore(t, snap) {
+  const put = (node, obj) => {
+    if (!node || !obj) return;
+    for (const [k, val] of Object.entries(obj)) if (val !== undefined && val !== null) setWidget(node, k, val);
+  };
+  writeSettings(t, snap.settings ?? {});
+  put(t.recall, { mode: snap.mode, subject: snap.subject, subject_weight: snap.subject_weight, prompt_prefix: snap.prompt_prefix });
+  put(byType(t, "OutpaintCanvas"), snap.canvas);
+  put(byType(t, "UpscaleSize"), snap.upscale);
+  put(step2(t), snap.step2);
+  put(renderScale(t), snap.render);
+  put(byType(t, PICKER), snap.tags);
+  if (snap.props) {
+    const props = (t.host.properties ??= {});
+    for (const [k, val] of Object.entries(snap.props)) {
+      if (val === undefined || val === null) delete props[k];
+      else props[k] = val;
+    }
+  }
+  syncUpscaleAspect(t);
+}
+
+// Store the current image's settings in its history entry (bump = move it to the top as just used).
+function remember(t, { bump = false, size } = {}) {
+  if (!history) return;
+  const filename = widget(t.recall, "image")?.value;
+  if (!filename || filename === "example.png") return;
+  const i = history.findIndex((h) => h.filename === filename);
+  const now = Date.now();
+  const e = i >= 0 ? history[i] : { filename, added: now, used: now };
+  e.snapshot = snapshot(t);
+  if (size) e.size = size;
+  if (bump || i < 0) {
+    e.used = now;
+    if (i >= 0) history.splice(i, 1);
+    history.unshift(e);
+  }
+  saveHistory();
+}
+
+const isLocked = (t) => !!t.host.properties?.imageRecallLock;
+
+// Seed control after each queued run, like ComfyUI's control_after_generate.
+const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
+const SEED_MAX = 2 ** 50; // ComfyUI's own random range (safe in JS numbers)
+const seedMode = (t) => (SEED_MODES.includes(t.host.properties?.imageRecallSeedMode) ? t.host.properties.imageRecallSeedMode : "fixed");
+const randomSeed = () => Math.floor(Math.random() * SEED_MAX);
+function stepSeed(t) {
+  const mode = seedMode(t);
+  if (mode === "fixed") return;
+  const s = readSettings(t);
+  const cur = Number.isFinite(Number(s.seed)) ? Number(s.seed) : 0;
+  s.seed = mode === "randomize" ? randomSeed()
+    : mode === "increment" ? (cur + 1) % SEED_MAX
+    : (cur - 1 + SEED_MAX) % SEED_MAX;
+  writeSettings(t, s);
+  remember(t);
+  t.host.imageRecallPanel?.render(null);
+}
+function allTargets() {
+  const out = [];
+  for (const n of app.graph?.nodes ?? app.graph?._nodes ?? []) {
+    const t = n.imageRecallTarget ?? targetOf(n);
+    if (t) out.push(t);
+  }
+  return out;
+}
+// The run was already built with the current seed; change it for the next one (once per queued run).
+if (!api.imageRecallSeedHook) {
+  api.imageRecallSeedHook = true;
+  const queue = api.queuePrompt.bind(api);
+  api.queuePrompt = async (...args) => {
+    const res = await queue(...args);
+    try {
+      for (const t of allTargets()) stepSeed(t);
+    } catch (err) {
+      console.warn("Image Recall: seed update failed", err);
+    }
+    return res;
+  };
+}
+
+// Lock: fill any setting the settings JSON leaves to "the image" from the current image first,
+// so the next image's metadata can't change it.
+function freezeSettings(t, r) {
+  if (!r) return;
+  const s = readSettings(t);
+  for (const [k, v] of Object.entries(settingsFromRecall(t, r))) if (s[k] === undefined || s[k] === null) s[k] = v;
+  writeSettings(t, s);
+}
+
+// reset: take the image's own values. snap: restore saved settings. force: ignore Lock ("Reset to image").
+async function loadImageInto(t, filename, { reset = false, snap = null, force = false, bump = true } = {}) {
   const panel = t.host.imageRecallPanel;
+  const locked = isLocked(t) && !force;
+  if (locked) freezeSettings(t, panel?.last?.());
+  else if (snap) restore(t, snap);
+  setWidget(t.recall, "image", filename);
   try {
     const r = await fetchRecall(t, filename);
-    if (reset) {
+    if (reset && !locked && !snap) {
       writeSettings(t, settingsFromRecall(t, r));
       applyDefaultsForImage(t, r);
+      await applyRecalledTags(t, r);
     }
+    await loadHistory();
+    remember(t, { bump, size: r.size });
     panel?.render(r);
   } catch (err) {
     panel?.render(null, String(err));
   }
+}
+
+// Large preview that follows the mouse while hovering a history thumbnail.
+const POPUP_MAX = 512;
+let popup = null;
+function showPopup(entry, ev) {
+  if (!popup) {
+    popup = el("div", { style: { position: "fixed", zIndex: "10000", pointerEvents: "none", display: "none",
+      background: "#111", border: "1px solid #555", borderRadius: "6px", padding: "4px",
+      boxShadow: "0 4px 16px rgba(0,0,0,0.6)", color: "#ddd", fontSize: "11px" } },
+      el("img", { style: { display: "block", maxWidth: `${POPUP_MAX}px`, maxHeight: `${POPUP_MAX}px`, borderRadius: "4px" } }),
+      el("div", { style: { marginTop: "3px", opacity: "0.8", whiteSpace: "nowrap", overflow: "hidden",
+        textOverflow: "ellipsis", maxWidth: `${POPUP_MAX}px` } }));
+    popup.firstChild.onload = () => movePopup();
+    document.body.append(popup);
+  }
+  const src = viewURL(entry.filename, "webp;85");
+  if (popup.firstChild.getAttribute("src") !== src) popup.firstChild.src = src;
+  const when = new Date(entry.used ?? entry.added ?? 0).toLocaleString();
+  popup.lastChild.textContent = `${entry.filename}  ${entry.size ?? ""}  ·  last used ${when}`;
+  popup.style.display = "block";
+  movePopup(ev);
+}
+let popupAt = { x: 0, y: 0 };
+function movePopup(ev) {
+  if (!popup || popup.style.display === "none") return;
+  if (ev) popupAt = { x: ev.clientX, y: ev.clientY };
+  const gap = 16;
+  const w = popup.offsetWidth, h = popup.offsetHeight;
+  let x = popupAt.x + gap, y = popupAt.y + gap;
+  if (x + w > window.innerWidth) x = Math.max(0, popupAt.x - gap - w);   // flip to the left
+  if (y + h > window.innerHeight) y = Math.max(0, window.innerHeight - h); // keep on screen
+  popup.style.left = `${x}px`;
+  popup.style.top = `${y}px`;
+}
+function hidePopup() {
+  if (popup) popup.style.display = "none";
+}
+
+function viewURL(filename, preview) {
+  const k = filename.lastIndexOf("/");
+  const q = new URLSearchParams({ filename: filename.slice(k + 1), type: "input" });
+  if (k > 0) q.set("subfolder", filename.slice(0, k));
+  if (preview) q.set("preview", preview);
+  return api.apiURL(`/view?${q}`);
 }
 
 // ---------------------------------------------------------------- panel
@@ -199,8 +476,9 @@ function makePanel(t) {
   const changed = () => {
     t.host.graph?.setDirtyCanvas?.(true, true);
     app.graph?.change?.();
+    remember(t);
   };
-  const edit = (key, value) => {
+  const edit =(key, value) => {
     const s = readSettings(t);
     s[key] = value;
     writeSettings(t, s);
@@ -251,7 +529,7 @@ function makePanel(t) {
 
     // image
     const thumb = image
-      ? el("img", { src: api.apiURL(`/view?filename=${encodeURIComponent(image)}&type=input`),
+      ? el("img", { src: viewURL(image),
           style: { maxWidth: "96px", maxHeight: "96px", borderRadius: "4px" } })
       : null;
     root.append(el("div", { style: css.row }, thumb,
@@ -259,7 +537,14 @@ function makePanel(t) {
         ? `${image}\n${last?.size ?? ""}\nRead from: ${(last?.sources ?? []).join(", ") || "nothing"}`
         : "Drop an image anywhere in the window.\n(Shift+drop loads its workflow instead.)" })));
     if (lastError) root.append(el("div", { style: css.note, textContent: lastError }));
-    for (const n of last?.notes ?? []) root.append(el("div", { style: css.note, textContent: n }));
+    // Under Lock the notes describe the new picture's own (ignored) metadata, so don't alarm with them.
+    if (isLocked(t) && image) {
+      root.append(el("div", { style: css.dim, textContent: (last?.notes?.length
+        ? "Lock on: this picture's own metadata is ignored (it has none, or only some); the locked settings below are used."
+        : "Lock on: the settings below are used, not this picture's own.") }));
+    } else {
+      for (const n of last?.notes ?? []) root.append(el("div", { style: css.note, textContent: n }));
+    }
 
     // mode
     const modeRow = el("div", { style: css.row }, el("span", { style: css.label, textContent: "Mode" }));
@@ -279,8 +564,21 @@ function makePanel(t) {
           render(last);
         } }), m));
     }
+    modeRow.append(el("label", { title: "Lock: a new image (drop, paste or history) changes only the picture, not the settings",
+      style: { display: "flex", gap: "3px", alignItems: "center", marginLeft: "auto" } },
+      el("input", { type: "checkbox", checked: isLocked(t), onchange: (e) => {
+        t.host.properties ??= {};
+        t.host.properties.imageRecallLock = e.target.checked;
+        t.host.graph?.setDirtyCanvas?.(true, true);
+        app.graph?.change?.();
+        render(last, lastError);
+      } }), "Lock settings"));
     root.append(modeRow);
-    if (!image) return;
+    root.append(historySection(image));
+    if (!image) {
+      requestAnimationFrame(() => fitHost());
+      return;
+    }
 
     const choices = last?.choices ?? {};
     // model
@@ -299,10 +597,79 @@ function makePanel(t) {
         el("button", { textContent: "✕", style: css.input, onclick: () => {
           const ls = readSettings(t).loras ?? []; ls.splice(i, 1); edit("loras", ls); } })));
     });
-    root.append(row("Add LoRA", select(["(pick)", ...(choices.loras ?? [])], "(pick)", (v) => {
-      if (v === "(pick)") return;
-      edit("loras", [...(readSettings(t).loras ?? []), { name: v, on: true, model: 1, clip: 1 }]);
-    }, "100%")));
+    // Add LoRA: a dropdown box like the checkpoint one. It opens ComfyUI's list menu (the same one
+    // rgthree's Power Lora Loader uses), where typing filters the LoRAs by name/path.
+    const addLora = (name) => edit("loras", [...(readSettings(t).loras ?? []), { name, on: true, model: 1, clip: 1 }]);
+    const addBox = el("button", { title: "Add a LoRA (type in the list to search)",
+      style: { ...css.input, width: "100%", textAlign: "left", cursor: "pointer", display: "flex",
+        justifyContent: "space-between" } },
+      el("span", { textContent: "Add LoRA…" }), el("span", { textContent: "▾" }));
+    addBox.onclick = (e) => {
+      const taken = new Set((readSettings(t).loras ?? []).map((l) => l.name));
+      const items = (choices.loras ?? []).filter((n) => !taken.has(n));
+      const LG = window.LiteGraph;
+      if (!LG?.ContextMenu || !items.length) return;
+      new LG.ContextMenu(items, {
+        event: e,
+        title: "Choose a lora",
+        scale: Math.max(1, app.canvas?.ds?.scale ?? 1),
+        className: "dark",
+        callback: (value) => {
+          const name = typeof value === "string" ? value : value?.content;
+          if (name) addLora(name);
+        },
+      });
+    };
+    root.append(row("Add LoRA", addBox));
+
+    // LoRA tags (the picker inside the subgraph adds the active ones to the prompt at queue time)
+    const picker = byType(t, PICKER);
+    const onLoras = loras.filter((l) => l.on !== false);
+    if (picker && onLoras.length) {
+      root.append(el("div", { style: css.head, textContent: "LoRA tags (click to add to the prompt)" }));
+      root.append(row("Tags go", select(["after prompt", "before prompt"], widget(picker, "tag_position")?.value,
+        (v) => { setWidget(picker, "tag_position", v); changed(); })));
+      const maxTags = Number(widget(picker, "max_tags")?.value ?? 8);
+      for (const l of onLoras) {
+        const box = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center" } },
+          el("span", { style: { ...css.label, minWidth: "0", width: "100%" }, textContent: l.name.split("/").pop() }));
+        root.append(box);
+        loraTags(l.name).then((info) => {
+          const { front, auto } = frontOf(info, maxTags);
+          const showAll = t.host.imageRecallAllTags?.has(l.name);
+          const list = showAll ? (info.tags ?? []) : front;
+          if (!list.length) box.append(el("span", { style: css.dim, textContent: info.note || "no tags in this file" }));
+          for (const tag of list) {
+            const isOn = () => pickerState(picker).overrides[l.name]?.[tag.tag] ?? auto.has(tag.tag);
+            const chip = el("button", { textContent: tag.tag, title: tag.tier ?? "", style: { ...css.input,
+              cursor: "pointer", padding: "1px 6px", borderRadius: "10px",
+              background: isOn() ? "#2a6" : "var(--comfy-input-bg, #222)" } });
+            chip.onclick = () => {
+              const st = pickerState(picker);
+              const next = !isOn();
+              const forLora = (st.overrides[l.name] ??= {});
+              if (next === auto.has(tag.tag)) delete forLora[tag.tag];
+              else forLora[tag.tag] = next;
+              if (!Object.keys(forLora).length) delete st.overrides[l.name];
+              setWidget(picker, "selection", JSON.stringify(st));
+              chip.style.background = next ? "#2a6" : "var(--comfy-input-bg, #222)";
+              changed();
+            };
+            box.append(chip);
+          }
+          const more = (info.tags ?? []).length - front.length;
+          if (more > 0) {
+            box.append(el("button", { textContent: showAll ? "fewer" : `+${more} more`, style: { ...css.input, cursor: "pointer" },
+              onclick: () => {
+                const set = (t.host.imageRecallAllTags ??= new Set());
+                showAll ? set.delete(l.name) : set.add(l.name);
+                render(last);
+              } }));
+          }
+          requestAnimationFrame(() => fitHost());
+        });
+      }
+    }
 
     // prompts
     root.append(el("div", { style: css.head, textContent: "Prompt" }));
@@ -321,7 +688,12 @@ function makePanel(t) {
 
     // sampler
     root.append(el("div", { style: css.head, textContent: "Sampler" }));
-    root.append(row("Seed", num(s.seed, 1, (v) => edit("seed", v ?? 0), "170px")));
+    root.append(row("Seed", num(s.seed, 1, (v) => edit("seed", v ?? 0), "170px"),
+      el("button", { textContent: "🎲", title: "New random seed now", style: { ...css.input, cursor: "pointer" },
+        onclick: () => edit("seed", randomSeed()) }),
+      el("span", { textContent: "after each run:" }),
+      select(SEED_MODES, seedMode(t), (v) => {
+        (t.host.properties ??= {}).imageRecallSeedMode = v; changed(); })));
     root.append(row("Steps", num(s.steps, 1, (v) => edit("steps", v ?? 1)),
       el("span", { textContent: "CFG" }), num(s.cfg, 0.1, (v) => edit("cfg", v ?? 1))));
     root.append(row("Sampler", select(choices.samplers ?? [], s.sampler, (v) => edit("sampler", v)),
@@ -335,8 +707,50 @@ function makePanel(t) {
         setWidget(canvas, "aspect", v); syncUpscaleAspect(t); changed(); render(last); }),
         el("span", { textContent: "Original at" }), select(ANCHORS, widget(canvas, "anchor")?.value, (v) => {
           setWidget(canvas, "anchor", v); changed(); render(last); })));
-      root.append(row("Feather", num(widget(canvas, "feather")?.value, 8, (v) => {
-        setWidget(canvas, "feather", v ?? 48); changed(); })));
+      const [srcW, srcH] = (last?.size ?? "1024x1024").split("x").map(Number);
+      const rw = Number(widget(canvas, "resize_width")?.value ?? 0);
+      const rh = Number(widget(canvas, "resize_height")?.value ?? 0);
+      const p = placedSize(srcW, srcH, widget(canvas, "aspect")?.value ?? "16:9", rw, rh);
+      root.append(row("Resize to",
+        num(rw, 8, (v) => { setWidget(canvas, "resize_width", Math.max(0, v ?? 0)); changed(); render(last); }),
+        el("span", { textContent: "×" }),
+        num(rh, 8, (v) => { setWidget(canvas, "resize_height", Math.max(0, v ?? 0)); changed(); render(last); }),
+        el("span", { style: css.dim, textContent: `(0 = fit) → ${p.w}x${p.h} on ${p.W}x${p.H}` })));
+
+      // blend slider; it sets feather + repaint_original, re-fitted whenever the placed size changes
+      const props = (t.host.properties ??= {});
+      let b = Number(props.imageRecallBlend);
+      if (!Number.isFinite(b)) {
+        b = blendFrom(Number(widget(canvas, "feather")?.value ?? 48), Number(widget(canvas, "repaint_original")?.value ?? 0), p);
+      }
+      const apply = (val) => {
+        const q = blendParams(val, p);
+        if (widget(canvas, "feather")?.value !== q.feather) setWidget(canvas, "feather", q.feather);
+        if (widget(canvas, "repaint_original") && widget(canvas, "repaint_original").value !== q.repaint) {
+          setWidget(canvas, "repaint_original", q.repaint);
+        }
+        return q;
+      };
+      const describeBlend = (q) => `feather ${q.feather} px` + (q.repaint > 0
+        ? ` (whole picture) · picture redrawn ${Math.round(q.repaint * 100)}%`
+        : ` · picture kept${q.feather >= q.maxF ? " (only its centre)" : ""}`);
+      const q0 = apply(b);
+      const readout = el("span", { style: css.dim, textContent: describeBlend(q0) });
+      const slider = el("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(b),
+        title: "Left: keep as much of the dropped picture as possible. Right: let the generated scene take it over.",
+        style: { flex: "1", minWidth: "120px" } });
+      slider.addEventListener("input", () => { readout.textContent = describeBlend(blendParams(Number(slider.value), p)); });
+      slider.addEventListener("change", () => {
+        props.imageRecallBlend = Number(slider.value);
+        apply(props.imageRecallBlend);
+        changed();
+        render(last);
+      });
+      slider.addEventListener("pointerdown", (e) => e.stopPropagation()); // drag the slider, not the canvas
+      root.append(el("div", { style: css.row }, el("span", { style: css.label, textContent: "Blend" }),
+        el("span", { style: { fontSize: "11px" }, textContent: "keep picture" }), slider,
+        el("span", { style: { fontSize: "11px" }, textContent: "scene eats it" })));
+      root.append(el("div", { style: { ...css.dim, paddingLeft: "90px" } }, readout));
     }
 
     // upscale
@@ -344,6 +758,19 @@ function makePanel(t) {
     const s2 = step2(t);
     if (mode !== "outpaint" && up && s2) {
       root.append(el("div", { style: css.head, textContent: "Step 2 - Upscale (one SDXL pass)" }));
+      const autoLabel = mode === "upscale" ? "auto (picture's own shape)" : "auto (same as Step 1)";
+      const shapes = [UP_AUTO, FROM_IMAGE, ...ASPECTS];
+      const shapeSel = select(shapes, upShape(t), (v) => {
+        (t.host.properties ??= {}).imageRecallUpAspect = v;
+        syncUpscaleAspect(t); changed(); render(last); });
+      for (const o of shapeSel.options) {
+        if (o.value === UP_AUTO) o.textContent = autoLabel;
+        if (o.value === FROM_IMAGE) o.textContent = "picture's own shape";
+      }
+      const rs = renderScale(t);
+      const fit = rs ? select(["stretch", "crop"], widget(rs, "crop")?.value === "disabled" ? "stretch" : "crop", (v) => {
+        setWidget(rs, "crop", v === "stretch" ? "disabled" : "center"); changed(); }) : null;
+      root.append(row("Shape", shapeSel, fit ? el("span", { textContent: "to fit:" }) : null, fit));
       root.append(row("Long side", num(widget(up, "long_side")?.value, 8, (v) => {
         setWidget(up, "long_side", v ?? 1920); changed(); render(last); })));
       root.append(row("Steps", num(widget(s2, "steps")?.value, 1, (v) => {
@@ -356,17 +783,77 @@ function makePanel(t) {
     root.append(el("div", { style: css.head, textContent: "Estimate" }));
     root.append(el("div", { style: css.dim, textContent: estimate(s) }));
     root.append(el("button", { textContent: "Reset to image", style: { ...css.input, alignSelf: "flex-start" },
-      onclick: () => loadImageInto(t, image, { reset: true }) }));
+      onclick: () => loadImageInto(t, image, { reset: true, force: true }) }));
 
-    requestAnimationFrame(() => {
-      const h = root.scrollHeight + 12;
-      if (Math.abs((t.host.imageRecallPanelHeight ?? 0) - h) > 4) {
-        t.host.imageRecallPanelHeight = h;
-        const size = t.host.computeSize?.() ?? t.host.size;
-        t.host.setSize?.([Math.max(t.host.size[0], 480), Math.max(size[1], h + 40)]);
-        t.host.graph?.setDirtyCanvas?.(true, true);
+    requestAnimationFrame(() => fitHost());
+  }
+
+  // thumbnails of every imported image; click = load, ✕ = remove from history, Ctrl+wheel = size
+  function historySection(current) {
+    hidePopup(); // the panel is being rebuilt; its cells won't send mouseleave
+    const box = el("div", { style: { display: "flex", flexDirection: "column", gap: "4px" } });
+    const list = history ?? [];
+    box.append(el("div", { style: css.head, textContent: `History (${history ? list.length : "…"})` }));
+    if (!list.length) {
+      box.append(el("div", { style: css.dim, textContent: history ? "Imported images show up here." : "loading…" }));
+      return box;
+    }
+    box.append(el("div", { style: css.dim, textContent: `Click to load${isLocked(t) ? " (Lock on: picture only)" : " with its settings"}`
+      + " · ✕ removes it from the history · Ctrl+wheel resizes" }));
+    let size = 96;
+    try { size = Math.min(320, Math.max(48, Number(localStorage.getItem(THUMB_KEY)) || 96)); } catch {}
+    const grid = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "4px", overflowY: "auto",
+      maxHeight: `${size * 3 + 16}px` } });
+    const cells = [];
+    for (const e of list) {
+      const cell = el("div", { style: { position: "relative", flex: "none", width: `${size}px`, height: `${size}px` } });
+      const img = el("img", { src: viewURL(e.filename, "webp;70"), loading: "lazy", draggable: false,
+        style: { width: "100%", height: "100%", objectFit: "cover", borderRadius: "4px", cursor: "pointer",
+          boxSizing: "border-box", border: `2px solid ${e.filename === current ? "#4af" : "transparent"}`, background: "#111" },
+        onclick: () => loadImageInto(t, e.filename, { snap: e.snapshot, reset: !e.snapshot }) });
+      img.onerror = () => { img.style.opacity = "0.3"; cell.title = `${e.filename}\n(file not found in ComfyUI/input)`; hidePopup(); };
+      const x = el("button", { textContent: "✕", title: "Remove from history (the file stays in ComfyUI/input)",
+        style: { ...css.input, position: "absolute", top: "2px", right: "2px", padding: "0 4px", lineHeight: "16px",
+          cursor: "pointer", display: "none", background: "rgba(0,0,0,0.7)" },
+        onclick: (ev) => {
+          ev.stopPropagation();
+          const i = history.indexOf(e);
+          if (i >= 0) history.splice(i, 1);
+          saveHistory();
+          render(last, lastError);
+        } });
+      cell.addEventListener("mouseenter", (ev) => { x.style.display = "block"; showPopup(e, ev); });
+      cell.addEventListener("mousemove", (ev) => movePopup(ev));
+      cell.addEventListener("mouseleave", () => { x.style.display = "none"; hidePopup(); });
+      cell.append(img, x);
+      cells.push(cell);
+      grid.append(cell);
+    }
+    grid.addEventListener("wheel", (ev) => {
+      if (!ev.ctrlKey) {
+        if (grid.scrollHeight > grid.clientHeight) ev.stopPropagation(); // scroll the list, not the canvas
+        return;
       }
-    });
+      ev.preventDefault();
+      ev.stopPropagation();
+      size = Math.min(320, Math.max(48, size + (ev.deltaY < 0 ? 16 : -16)));
+      try { localStorage.setItem(THUMB_KEY, String(size)); } catch {}
+      for (const c of cells) { c.style.width = `${size}px`; c.style.height = `${size}px`; }
+      grid.style.maxHeight = `${size * 3 + 16}px`;
+      requestAnimationFrame(() => fitHost());
+    }, { passive: false });
+    box.append(grid);
+    return box;
+  }
+
+  function fitHost() {
+    const h = root.scrollHeight + 12;
+    if (Math.abs((t.host.imageRecallPanelHeight ?? 0) - h) > 4) {
+      t.host.imageRecallPanelHeight = h;
+      const size = t.host.computeSize?.() ?? t.host.size;
+      t.host.setSize?.([Math.max(t.host.size[0], 480), Math.max(size[1], h + 40)]);
+      t.host.graph?.setDirtyCanvas?.(true, true);
+    }
   }
 
   async function refreshPrompt() {
@@ -380,13 +867,14 @@ function makePanel(t) {
         cur.positive = r.outpaint_positive;
         writeSettings(t, cur);
       }
+      remember(t);
       render(r);
     } catch (err) {
       render(null, String(err));
     }
   }
 
-  return { root, render };
+  return { root, render, last: () => last };
 }
 
 function attachPanel(node) {
@@ -405,8 +893,12 @@ function attachPanel(node) {
   if (w) w.serializeValue = () => undefined;
   if (node.size[0] < 480) node.setSize?.([480, node.size[1]]);
   const image = widget(t.recall, "image")?.value;
-  if (image && image !== "example.png") loadImageInto(t, image, { reset: !widget(t.recall, "settings")?.value });
-  else panel.render(null);
+  if (image && image !== "example.png") {
+    loadImageInto(t, image, { reset: !widget(t.recall, "settings")?.value, force: true, bump: false });
+  } else {
+    panel.render(null);
+    loadHistory().then(() => panel.render(null));
+  }
 }
 
 // ---------------------------------------------------------------- text height (3x default)

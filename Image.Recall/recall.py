@@ -145,6 +145,7 @@ def from_graph(prompt) -> dict:
     pos, neg = g.prompt_texts(prompt, anchor)
     loras = g.collect_loras(prompt, dist, save, never, None)
     return {
+        "lora_tags": _picker_tags(prompt, dist),
         "checkpoint": f.get("model"),
         "positive": pos or None,
         "negative": neg or None,
@@ -235,6 +236,26 @@ def _a1111_schedule(schedule):
     return A1111_SCHEDULERS.get(low, low.replace(" ", "_"))
 
 
+def _picker_tags(prompt, dist):
+    """The LoRA tags a LoRA Tag Picker upstream of the save node added, as
+    {"position": "before prompt"|"after prompt", "resolved": [{"lora", "tags"}]}."""
+    for nid in sorted(dist, key=g.natural_id):
+        node = prompt.get(nid) or {}
+        if node.get("class_type") != "LoraTagPicker":
+            continue
+        inputs = node.get("inputs") or {}
+        try:
+            sel = json.loads(inputs.get("selection") or "{}")
+        except (TypeError, ValueError):
+            continue
+        resolved = [{"lora": str(e.get("lora")), "tags": [str(t) for t in e.get("tags") or []]}
+                    for e in (sel.get("resolved") or []) if isinstance(e, dict) and e.get("lora")]
+        if resolved:
+            pos = inputs.get("tag_position")
+            return {"position": pos if isinstance(pos, str) else "after prompt", "resolved": resolved}
+    return None
+
+
 # --- combining -------------------------------------------------------------
 def recall(info: dict) -> dict:
     """Everything the metadata says about how the image was made.
@@ -258,6 +279,8 @@ def recall(info: dict) -> dict:
             if out[k] in (None, "") and got.get(k) not in (None, ""):
                 out[k] = got[k]
                 used = True
+        if out.get("lora_tags") is None and got.get("lora_tags"):
+            out["lora_tags"] = got["lora_tags"]
         if out["loras"] is None and got.get("loras") is not None:
             out["loras"] = got["loras"]
             used = used or bool(got["loras"])

@@ -15,7 +15,7 @@ import folder_paths
 from comfy.cli_args import args
 from nodes import SaveImage
 
-from .pathbuilder import DEFAULT_TEMPLATE, build_metadata, build_prefix, find_vae, prompt_texts
+from .pathbuilder import DEFAULT_TEMPLATE, build_metadata, build_prefix, find_vae, prompt_texts_near
 
 log = logging.getLogger("TaggedImageSaver")
 
@@ -130,7 +130,7 @@ class TaggedImageSaver(SaveImage):
         fields = None
         if info is not None:
             try:
-                positive, negative = prompt_texts(prompt or {}, info.get("anchor"))
+                positive, negative = prompt_texts_near(prompt or {}, unique_id, info.get("anchor"))
                 vae = find_vae(prompt or {}, str(unique_id))
                 fields = build_metadata(info, width, height, positive, negative, vae)
             except Exception:
