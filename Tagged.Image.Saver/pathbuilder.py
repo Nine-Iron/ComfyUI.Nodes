@@ -482,7 +482,7 @@ def _linked_text(prompt, value, depth=0):
         if isinstance(meta.get(key), str):
             return meta[key]
     inputs = node.get("inputs") or {}
-    for key in ("text", "string", "value", "prompt", "populated_text", "wildcard_text", "template"):
+    for key in ("text", "string", "value", "prompt", "populated_text", "wildcard_text"):
         if key in inputs:
             got = _linked_text(prompt, inputs[key], depth + 1)
             if got:
@@ -524,23 +524,6 @@ def prompt_texts(prompt, anchor) -> tuple[str, str]:
     return _cond_text(prompt, pos), _cond_text(prompt, neg)
 
 
-def prompt_texts_near(prompt, save_id, anchor) -> tuple[str, str]:
-    """prompt_texts for the anchor; when the anchor has no prompt inputs (a node that only
-    carries sampler settings, such as Image Recall), the nearest sampler upstream of the
-    save node that has them."""
-    pos, neg = prompt_texts(prompt, anchor)
-    if pos or neg or save_id is None:
-        return pos, neg
-    dist = upstream_distances(prompt or {}, str(save_id))
-    for nid in sorted(dist, key=lambda n: (dist[n], natural_id(n))):
-        inputs = ((prompt or {}).get(nid) or {}).get("inputs") or {}
-        if is_link(inputs.get("positive")) or is_link(inputs.get("guider")):
-            pos, neg = prompt_texts(prompt, nid)
-            if pos or neg:
-                return pos, neg
-    return "", ""
-
-
 def format_lora_field(loras) -> str:
     """'name:0.8, other:0.65/0.5' (clip strength after '/' only when it differs)."""
     parts = []
@@ -564,7 +547,7 @@ def find_vae(prompt, save_id):
     return None
 
 
-def build_metadata(info, width, height, positive="", negative="", vae=None) -> dict:
+def build_metadata(info, width, height, positive="", negative="", vae=None, hashes=None) -> dict:
     """Ordered {keyword: text} of what produced the image; empty values left out.
     'parameters' is the same data in A1111 form for Civitai and other readers."""
     f = info.get("fields") or {}
@@ -594,6 +577,11 @@ def build_metadata(info, width, height, positive="", negative="", vae=None) -> d
              ("Seed", out.get("Seed")), ("Size", out.get("Size")), ("Model", out.get("Model")),
              ("Denoising strength", out.get("Denoise")), ("Distilled CFG Scale", out.get("Guidance")),
              ("VAE", out.get("VAE"))]
+    hashes = hashes or {}
+    # Civitai links the image to model/LoRA pages only through these hashes.
+    if hashes.get("Model hash"):
+        pairs.insert(pairs.index(("Model", out.get("Model"))) + 1, ("Model hash", hashes["Model hash"]))
+    pairs.append(("Lora hashes", hashes.get("Lora hashes")))
     settings = ", ".join(f"{k}: {v}" for k, v in pairs if v)
     lora_tags = " ".join(f"<lora:{model_stem(l['name'])}:{fmt_num(l['model'])}>" for l in loras)
     lines = [" ".join(t for t in (positive, lora_tags) if t)]
