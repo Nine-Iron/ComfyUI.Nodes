@@ -1,0 +1,62 @@
+{
+ "/home/jetson/ComfyUI/models/checkpoints/sdxl1/RealVisXL_V5.0_fp16.safetensors": {
+  "size": 6938065488,
+  "mtime": 1792222925.1909277,
+  "v2": "6a35a7855770ae9820a3c931d4964c3817b6d9e3c6f9c4dabb5b3a94e5643b80"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/ais-blmn-sdxl.safetensors": {
+  "size": 228455548,
+  "mtime": 1794298088.8450735,
+  "v3": "19f617b25791a2b271dd3698eb161d572d12487390c9e79b57bde6549437863f"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/Psych-Futurism.safetensors": {
+  "size": 228466404,
+  "mtime": 1794298836.8228846,
+  "v3": "e64fcda63980aa681255138cabca83a3642c336a4ffb869a29983e5b9e31035e"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/SDXLFaeTastic2400.safetensors": {
+  "size": 456496700,
+  "mtime": 1794298801.6002808,
+  "v3": "e7da1e0c0933e86f379590e48498cac03130753874a389045b546f4ca88de937"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/aidmaBokehmachine-V0.1.safetensors": {
+  "size": 456490316,
+  "mtime": 1794298369.8050363,
+  "v3": "4093aba407fe8019ed1d2f030b8c3329a2dbc8bf85897e8d4f13b416526cc3b8"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/aidmaFluxStyleXL-v0.2.safetensors": {
+  "size": 456502940,
+  "mtime": 1794298408.1781416,
+  "v3": "6c2a2b2c3859876037455867dda839dad7a18c9245f18c9359134863d8248fe1"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/aidmaImageUpgraderSDXL-v0.3.safetensors": {
+  "size": 912577828,
+  "mtime": 1794298393.2177103,
+  "v3": "06fe599be51955e94dc01e844bfac50d31febcfc6c4391074562771f8d3560ae"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/ptchkrawk.safetensors": {
+  "size": 228463308,
+  "mtime": 1794298352.492539,
+  "v3": "9dcfd3fc0f491feae481936daeaa00f8e5c7278ccfc793d414c3d12e43e4f4a9"
+ },
+ "/home/jetson/ComfyUI/models/checkpoints/sdxl1/ReaXL_v3.0.safetensors": {
+  "size": 6938042184,
+  "mtime": 1792829630.5543334,
+  "v2": "450d524488f1d81d027e5c352f9dad5c48dd3cc7f9441933823ff77a46ec0b8c"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/PsychedelicDream-xl-10.safetensors": {
+  "size": 228457732,
+  "mtime": 1794298688.5543036,
+  "v3": "c24fb68d6644696d3170157552b37a2fa3645dc1850b450f8ccee4840b531634"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/electricart-v3-09182024.safetensors": {
+  "size": 513514284,
+  "mtime": 1794298318.5275652,
+  "v3": "aa0be30a44c879eb1b9ef0cead7f59a678b18477f02a79096e15725c0e117052"
+ },
+ "/home/jetson/ComfyUI/models/loras/sdxl1/RM_smoke_style_loha_v1.0.safetensors": {
+  "size": 118193268,
+  "mtime": 1794298729.8355155,
+  "v3": "4d2492d33435f77ca53228b40572540a5861d21cfba27294bee48d0d2045adf6"
+ }
+}
